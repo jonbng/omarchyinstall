@@ -1,0 +1,38 @@
+[package]
+name = "omarchyinstall"
+version = "0.1.0"
+description = "Windows desktop installer (Tauri 2). Dev on macOS/Linux, production on Windows."
+authors = ["you"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+# Unique lib name so it does not collide with the Windows exe (rust-lang/cargo#8519).
+name = "omarchyinstall_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-log = "2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+serde_json = "1"

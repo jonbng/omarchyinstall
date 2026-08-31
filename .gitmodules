@@ -1,0 +1,12 @@
+[submodule "references/omarchy"]
+	path = references/omarchy
+	url = https://github.com/omacom/omarchy.git
+	branch = quattro
+[submodule "references/omarchy-iso"]
+	path = references/omarchy-iso
+	url = https://github.com/omacom/omarchy-iso.git
+	branch = quattro
+[submodule "references/omarchy-site"]
+	path = references/omarchy-site
+	url = https://github.com/omacom/omarchy-site.git
+	branch = master
