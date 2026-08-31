@@ -1,122 +1,136 @@
-:root {
-  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
-  font-size: 16px;
-  line-height: 1.5;
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 300;
+  src: url("/fonts/JetBrainsMono-Light.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: italic;
+  font-weight: 300;
+  src: url("/fonts/JetBrainsMono-Italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: normal;
   font-weight: 400;
-  color: #0f0f0f;
-  background-color: #f4f4f5;
+  src: url("/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: italic;
+  font-weight: 400;
+  src: url("/fonts/JetBrainsMono-Italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  src: url("/fonts/JetBrainsMono-Medium.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 600;
+  src: url("/fonts/JetBrainsMono-SemiBold.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  src: url("/fonts/JetBrainsMono-Bold.woff2") format("woff2");
+}
+
+:root {
+  --rgb-night: 26, 27, 38;
+  --rgb-storm: 36, 40, 59;
+  --rgb-black: 0, 0, 0;
+  --rgb-green: 158, 206, 106;
+  --rgb-term-black: 65, 72, 104;
+  --rgb-blue: 122, 162, 247;
+  --rgb-cyan: 125, 207, 255;
+  --rgb-white: 192, 202, 245;
+  --rgb-turquoise: 180, 249, 248;
+  --rgb-red: 247, 118, 142;
+  --rgb-yellow: 224, 175, 104;
+  --rgb-orange: 255, 158, 100;
+  --rgb-comment: 86, 95, 137;
+  --rgb-teal: 115, 218, 202;
+
+  --bg: rgb(var(--rgb-night));
+  --bg-storm: rgb(var(--rgb-storm));
+  --fg: rgb(var(--rgb-white));
+  --muted: rgb(var(--rgb-comment));
+  --line: rgb(var(--rgb-term-black) / 0.8);
+  --green: rgb(var(--rgb-green));
+  --blue: rgb(var(--rgb-blue));
+  --cyan: rgb(var(--rgb-cyan));
+  --turquoise: rgb(var(--rgb-turquoise));
+  --red: rgb(var(--rgb-red));
+  --yellow: rgb(var(--rgb-yellow));
+  --orange: rgb(var(--rgb-orange));
+  --teal: rgb(var(--rgb-teal));
+  --ok: var(--green);
+  --ok-bg: rgb(var(--rgb-green) / 0.12);
+  --warn-fg: var(--yellow);
+  --warn-bg: rgb(var(--rgb-yellow) / 0.12);
+  --err-fg: var(--red);
+  --err-bg: rgb(var(--rgb-red) / 0.12);
+  --primary: var(--blue);
+  --primary-fg: var(--bg);
+  --danger: var(--red);
+  --danger-fg: var(--bg);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --transition: 0.15s cubic-bezier(0.33, 1, 0.68, 1);
+
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.45;
+  color: var(--fg);
+  background: var(--bg);
+  color-scheme: dark;
   font-synthesis: none;
+  font-variant-ligatures: none;
+  font-feature-settings: "zero" 1, "calt" 0, "liga" 0, "ss02" 1;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
 }
 
 * {
   box-sizing: border-box;
+  border-radius: 0;
 }
 
-body {
+html,
+body,
+#root {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
 }
 
-.app {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 2.5rem 1.5rem;
+::selection {
+  background: var(--green);
+  color: var(--bg);
 }
 
-h1 {
-  margin: 0 0 0.25rem;
-  font-size: 1.5rem;
-}
-
-h2 {
-  margin: 0 0 1rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: #52525b;
-}
-
-.lede {
-  margin: 0;
-  color: #52525b;
-}
-
-.banner {
-  margin: 1.25rem 0 0;
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  background: #fef3c7;
-  color: #78350f;
-}
-
-.banner.error {
-  background: #fee2e2;
-  color: #7f1d1d;
-}
-
-.panel {
-  margin-top: 1.5rem;
-  padding: 1.25rem;
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
-}
-
-dl {
-  display: grid;
-  gap: 0.75rem 1.5rem;
-  margin: 0;
-}
-
-dl > div {
-  display: grid;
-  grid-template-columns: 8rem 1fr;
-  gap: 0.75rem;
-}
-
-dt {
-  color: #71717a;
-  font-weight: 500;
-}
-
-dd {
-  margin: 0;
-  font-variant-numeric: tabular-nums;
-}
-
-.muted {
-  margin: 0;
-  color: #71717a;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f4f4f5;
-    background-color: #18181b;
-  }
-
-  h2,
-  .lede,
-  dt,
-  .muted {
-    color: #a1a1aa;
-  }
-
-  .panel {
-    background: #27272a;
-    box-shadow: none;
-  }
-
-  .banner {
-    background: #422006;
-    color: #fde68a;
-  }
-
-  .banner.error {
-    background: #450a0a;
-    color: #fecaca;
-  }
+:focus-visible {
+  outline: 1px solid var(--blue);
+  outline-offset: 2px;
 }

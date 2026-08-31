@@ -19,7 +19,7 @@ This is **not Wubi**. Wubi (Ubuntu 8.04–12.04) installed Linux as a loopback f
 
 Closer analogies than Wubi: a Windows `setup.exe` that stages a real Linux installer on-disk and reboots into it; ChromeOS Flex / CloudReady’s “install from Windows” idea; Rufus or Ventoy automation. The end state is the opposite of those tools’ usual “keep Windows” posture: **Windows is the scaffolding, and scaffolding is demolished.**
 
-The product ships as a normal NSIS/MSI download (this Tauri 2 app). It does **not** bundle the ~6 GB Omarchy ISO. At runtime it shrinks Windows, creates an installer partition **and a tiny `cidata` volume**, downloads `https://iso.omarchy.org/omarchy-4.0.2.iso` (current as of 2026-08-31) plus `.sha256` / `.sig` sidecars **directly onto the installer partition**, verifies them, plants the official ISO GRUB on the existing ESP so its *embedded* search finds a config we wrote, writes autoinstall files so the Linux configurator is **skipped**, sets a one-shot UEFI `BootNext`, and reboots. The stock orchestrator then full-disk-wipes the Windows disk (`wipe: true`), including the staging partitions.
+The product ships as one portable `OmarchyInstaller.exe` (this Tauri 2 app). It does **not** bundle the ~6 GB Omarchy ISO. At runtime it shrinks Windows, creates an installer partition **and a tiny `cidata` volume**, downloads `https://iso.omarchy.org/omarchy-4.0.2.iso` (current as of 2026-08-31) plus `.sha256` / `.sig` sidecars **directly onto the installer partition**, verifies them, plants the official ISO GRUB on the existing ESP so its *embedded* search finds a config we wrote, writes autoinstall files so the Linux configurator is **skipped**, sets a one-shot UEFI `BootNext`, and reboots. The stock orchestrator then full-disk-wipes the Windows disk (`wipe: true`), including the staging partitions.
 
 ---
 
@@ -27,7 +27,7 @@ The product ships as a normal NSIS/MSI download (this Tauri 2 app). It does **no
 
 A person on a Windows PC who wants Omarchy should be able to:
 
-1. Download a normal Windows installer (NSIS or MSI) — **Omarchy Install**, identifier `dk.jonathanb.omarchyinstall`.
+1. Download and run the portable **OmarchyInstaller.exe**. It does not register an installed application or uninstaller.
 2. Run it elevated (Administrator). If it is not elevated, it offers **Relaunch as Administrator** (`ShellExecuteW` `runas`) and refuses to mutate the disk.
 3. Walk a wizard that is explicit to the point of being rude: **this will erase Windows and all data on the selected disk and install Omarchy.**
 4. Let the app check the machine (UEFI, GPT, disk map, BitLocker, Secure Boot, RAM, arch, elevation, shrinkable free space).
@@ -108,11 +108,11 @@ The Windows app is a bootstrap. It does not reimplement partitioning, pacstrap, 
 - **Not dual-boot.** The ISO’s free-space path exists (`manual/50-dual-boot-install.md`). This product is the full-disk replacement path. Cidata always emits `"mode": "full_disk"` and `"wipe": true`. We do not generate a free-space layout.
 - **Not a reimplementation of the Omarchy installer.** No Windows-side pacstrap, no Windows-side Limine install of the final OS. The Windows wizard **does** collect the same answers the configurator would and writes them as cidata; the orchestrator still does the install.
 - **Not a Secure Boot signing program.** Consumer Secure Boot is `references/omarchy-iso/plans/consumer-secure-boot.md` — future ISO work, not this app’s job.
-- **Not bundling the 6 GB ISO in the NSIS/MSI.** The Windows download stays small and the ISO stays current.
+- **Not bundling the 6 GB ISO in the portable EXE.** The Windows download stays small and the ISO stays current.
 - **Not BIOS/CSM, not ARM Windows, not Dynamic Disks, not Storage Spaces, not Intel RST/VMD RAID, not multi-disk “install Omarchy on the other drive” in v1.** RST is a hard block, not a warning.
 - **Not silently decrypting BitLocker, not clearing TPM, not modifying BitLocker protectors.** TPM presence is informational.
-- **Not Authenticode-signing the NSIS/MSI until first public release.** Dogfood unsigned internally. Signing is release-engineering, not a blocker for probe/wizard/lab.
-- **Not 8 GiB RAM in v1.** v1 hard-gates 16 GiB installed / ~14 GiB `ullTotalPhys`. **v1.1** is Candidate C (userspace copy-then-unmount) for 8 GiB SKUs — scheduled, not rejected.
+- **Not Authenticode-signing the portable EXE until first public release.** Dogfood unsigned internally. Signing is release-engineering, not a blocker for probe/wizard/lab.
+- **Not 8 GiB RAM in v1.** v1 hard-gates 16 GiB installed / ~14 GiB `ullTotalPhys`, but this may exclude too much otherwise-supported hardware and must be revisited after v1. Candidate C (userspace copy-then-unmount) improves failure handling but, by itself, does **not** lower the RAM requirement because it still copies the same ~6 GiB squashfs into tmpfs. A genuinely lower-memory path needs Candidate D, a smaller/network-backed live environment, or an ISO whose live root and offline mirror are separated.
 - **Not claiming “zero ISO bytes changed” until PR 7a measures it.** Initramfs `ntfs3` and `copytoram=y` releasing `img_dev` are lab gates. If either fails, we propose a patch against `references/omarchy-iso/` and do not ship mutate-capable Windows code against an ISO that cannot hand off.
 
 ---
@@ -139,11 +139,11 @@ The Windows app is a bootstrap. It does not reimplement partitioning, pacstrap, 
 
 ### Already here
 
-This is a **Tauri 2** desktop app: React 19 + Vite frontend, Rust backend. Production is Windows only (NSIS + MSI, WebView2 bootstrapper download). `tauri dev` works on macOS/Linux so UI/IPC can be built there; Win32 is compiled only on Windows (`README.md`).
+This is a **Tauri 2** desktop app: React 19 + Vite frontend, Rust backend. Production is Windows only and ships as one portable `OmarchyInstaller.exe`, with an authenticated default-browser fallback when WebView2 is unavailable. `tauri dev` works on macOS/Linux so UI/IPC can be built there; Win32 is compiled only on Windows (`README.md`).
 
 | Piece | Path | What it does today |
 | --- | --- | --- |
-| Product metadata | `src-tauri/tauri.conf.json` | `productName: Omarchy Install`, `identifier: dk.jonathanb.omarchyinstall`, `version: 0.1.0`, window 960×680, bundle targets `nsis`/`msi`, `webviewInstallMode: downloadBootstrapper`, `nsis.installMode: "both"` (per-user *or* per-machine **installer**, not app elevation) |
+| Product metadata | `src-tauri/tauri.conf.json` | `productName: Omarchy Install`, `identifier: dk.jonathanb.omarchyinstall`, portable build only, embedded assets/icons, and a manually created native window so WebView failure can fall back to the browser |
 | Frontend | `src/App.tsx`, `src/types.ts`, `src/App.css` | Host-info panel only: OS, arch, osVersion, elevated, nativeWindows. **No wizard.** |
 | IPC | `src-tauri/src/commands.rs` | Single command: `host_info` |
 | App builder | `src-tauri/src/lib.rs` | Plugins `opener`, `log`; registers `commands::host_info` |
@@ -159,7 +159,7 @@ This is a **Tauri 2** desktop app: React 19 + Vite frontend, Rust backend. Produ
 ### Must be built
 
 - Machine capability probe (Secure Boot, BitLocker, firmware, disks, RAM, shrink headroom, EFI variable access).
-- `src-tauri/windows.manifest` with `requestedExecutionLevel` `requireAdministrator`, plus a UI **Relaunch as Administrator** path. Tauri 2’s default app manifest is `asInvoker`; NSIS `installMode: "both"` does not elevate the app.
+- `src-tauri/windows.manifest` with `requestedExecutionLevel` `requireAdministrator`, plus a UI **Relaunch as Administrator** path for development builds.
 - Wizard UI (steps, copy, disk map, typed confirms) with **no disk mutation** until a late, gated step.
 - ISO download onto `OMARCHYINST`, resume, sha256, **required** GPG. `reqwest` in Rust; **no** Tauri HTTP plugin.
 - NTFS shrink + installer partition create (reversible).
@@ -229,7 +229,7 @@ sequenceDiagram
   participant Live as Official Omarchy live ISO
   participant Orch as Orchestrator (stock)
 
-  User->>App: Run NSIS/MSI, elevated
+  User->>App: Run portable EXE, elevated
   App->>App: probe_machine (UEFI, SB, BitLocker, RAM, disks)
   alt Secure Boot on / BitLocker not FullyDecrypted / RAM gate fail / not UEFI
     App-->>User: Block with instructions (no disk writes)
@@ -261,7 +261,7 @@ sequenceDiagram
 #### Phase A — Windows (this app), reversible
 
 1. Launch. If `elevated == false`: offer **Relaunch as Administrator** (`ShellExecuteW` verb `runas` on our exe). Packed builds should already be `requireAdministrator` via `src-tauri/windows.manifest`. Stub hosts (`platform/stub.rs`) never mutate; they only render UI. Download/verify **are** allowed on stub hosts (see API).
-2. `probe_machine`: UEFI, GPT, Secure Boot, BitLocker on **every** `Win32_EncryptableVolume` on the boot disk, RAM **installed** + `ullTotalPhys` (hard gate) and `ullAvailPhys` (warning only), CPU arch, disk map (ESP, MSR, C:, Recovery, free regions, per-partition type GUID / letter / label / GPT GUID), shrinkable bytes, EFI variable write access. Structured `blocking_reasons`.
+2. `probe_machine`: UEFI, GPT, Secure Boot, BitLocker on **every** `Win32_EncryptableVolume` on the boot disk, RAM **installed** + `ullTotalPhys` (hard gate) and `ullAvailPhys` (warning only), CPU arch, disk map (ESP, MSR, C:, Recovery, free regions, per-partition type GUID / letter / label / GPT GUID), shrinkable bytes, and EFI variable write access proven by creating, reading, and deleting an app-owned probe variable. The target ESP must be the unique ESP on the same disk as `C:`. Structured `blocking_reasons`.
 3. Wizard: identity (keyboard, username, password, hostname, timezone, encryption default-on; optional git name/email). Disk map. Typed confirmation (`ERASE WINDOWS`) **twice**. Linux will not ask. No writes yet.
 4. `HEAD` the pinned ISO URL for `Content-Length`. `OMARCHYINST` size = `max(8 GiB, content_length * 1.2 + 512 MiB)`. Add **64 MiB** for the `cidata` FAT32 partition (plus alignment).
 5. **Re-probe BitLocker, RST, and shrink headroom immediately before mutate.**
@@ -271,8 +271,8 @@ sequenceDiagram
    - `cidata` — FAT32, ~64 MiB, volume label `cidata` (Windows may store `CIDATA`; `omarchy-cidata-load` accepts both).
    Persist `state.json` **before** the shrink and again with both partition GUIDs.
 8. Download the ISO (resume via `Range`) to `\\?\Volume{OMARCHYINST-GUID}\omarchy.iso`, plus `.sha256` and `.sig` beside it. Verify in Rust against the sidecar and the pinned GPG key.
-9. Stage the ESP (Bootloader staging). Do not overwrite `EFI/Microsoft` or `EFI/Boot/bootx64.efi`.
-10. Hash the password with SHA-512 crypt (`$6$`, `openssl passwd -6` compatible) in Rust. Write cidata files onto the FAT volume (see Cidata autoinstall). **Do not persist the plaintext password in `state.json` after hashing.** Restrict the volume (no drive letter, Administrators+SYSTEM DACL).
+9. Stage the journaled ESP on the Windows boot disk (Bootloader staging). Never select the first ESP system-wide. Do not overwrite `EFI/Microsoft` or `EFI/Boot/bootx64.efi`.
+10. Hash the password with SHA-512 crypt (`$6$`, `openssl passwd -6` compatible) in Rust. Write cidata files onto the FAT volume (see Cidata autoinstall). **Do not persist the plaintext password in `state.json` after hashing.** Set the FAT partition hidden and no-default-drive-letter. FAT32 has no Windows ACL support, so this reduces accidental exposure but is not an access-control boundary against an administrator.
 11. Create a firmware boot entry pointing at `\EFI\OmarchyInstall\BOOTX64.EFI`. Set **`BootNext`**. Record `Boot####` in the journal. Do not prepend ourselves on `BootOrder`; see UEFI handoff if firmware ignores `BootNext`.
 12. Reboot.
 
@@ -491,7 +491,7 @@ The mirror lives *inside* the squashfs. Copying “airootfs only” copies the m
 
 ### Candidate C — userspace copy-then-unmount in `prepare_live`
 
-Same RAM cost as A, moved from initramfs to userspace. Advantage: gum error instead of an emergency shell. **Valid fallback if initramfs copy OOMs or leaves `img_dev` busy.** **Wrong fallback if NTFS cannot be mounted in initramfs** — we never reach userspace.
+Same RAM cost as A, moved from initramfs to userspace. Advantage: gum error instead of an emergency shell. **Valid fallback if initramfs copy leaves `img_dev` busy. It is not an 8 GiB solution:** copying later does not make the ~6 GiB squashfs smaller, and an OOM remains an OOM. **Wrong fallback if NTFS cannot be mounted in initramfs** — we never reach userspace.
 
 Sketch (against `references/omarchy-iso/`, not implemented here):
 
@@ -500,11 +500,24 @@ Sketch (against `references/omarchy-iso/`, not implemented here):
 
 ### Candidate D — “Install around the media, then eat it”
 
-Do not use full-disk `wipe: true`. Delete Windows partitions, keep `OMARCHYINST`, create Omarchy ESP+root in the hole, pacstrap from the still-mounted installer partition, then delete `OMARCHYINST`. RAM: ~2 GiB. **Not v1.** Not the stock full-disk path. (Unrelated to the 8 GiB RAM follow-up.)
+Do not use full-disk `wipe: true`. Delete Windows partitions while preserving `OMARCHYINST`, create the Omarchy ESP and root in the reclaimed space, and install from the still-mounted staging partition. Because the running live system itself depends on the ISO, it cannot safely delete `OMARCHYINST` before leaving that environment. The safer design is to boot the installed system, remove `OMARCHYINST` and `cidata` from a guarded first-boot service, then extend the adjacent root partition, LUKS mapping, and btrfs filesystem. Expected RAM is on the order of ~2 GiB rather than a ~6 GiB squashfs copy.
 
-### v1.1 follow-up — Candidate C for 8 GiB SKUs
+This is a credible lower-memory/offline design, but it trades the RAM requirement for substantially more installer complexity:
 
-v1 keeps the 16 GiB installed / ~14 GiB `ullTotalPhys` hard gate. **v1.1** is explicitly scheduled: Candidate C (userspace copy-then-unmount in `prepare_live`) so 8 GiB machines can install without a 6 GiB squashfs in tmpfs. That is an ISO-side patch plus a lowered Windows RAM gate. It is not a v1 goal and not a forever non-goal.
+- It replaces the stock, well-tested full-disk `wipe: true` layout with partition planning and cleanup that this project must own and keep compatible with upstream.
+- `OMARCHYINST` must be placed adjacent to the future root partition so its space can be reclaimed. OEM recovery partitions and unusual Windows layouts expand the test matrix.
+- Installation becomes two-stage. A power loss or cleanup failure can leave the staging partitions behind; recovery must be idempotent and the installed system should remain bootable.
+- Encrypted installs must grow the GPT partition, LUKS mapping, and btrfs filesystem in the correct order.
+- `cidata` and its sensitive installation material survive until first-boot cleanup instead of disappearing in the initial wipe.
+- The ISO, loop devices, offline-mirror bind mounts, and live root must remain intact through pacstrap. Cleanup cannot begin merely because package installation finished.
+
+The payoff is support for 8 GiB, and potentially 4 GiB, systems without requiring network access after Windows is erased. A stranded staging partition is generally recoverable, but this path requires dedicated lab coverage across representative OEM disk layouts. **Not v1.**
+
+### Future follow-up — lower-memory installs
+
+v1 keeps the 16 GiB installed / ~14 GiB `ullTotalPhys` hard gate because `copytoram=y` is the smallest change that preserves the stock full-disk installer. Treat that number as a conservative implementation constraint, **not** a permanent product requirement. Before broad release, measure the real peak and consider deriving the gate from the verified `airootfs.sfs` size plus measured headroom instead of a fixed SKU threshold.
+
+For actual 8 GiB support, investigate Candidate D as the offline path and a small network-backed live environment as the simpler online path. The online design can wipe normally and download packages afterward, but it makes working networking after the destructive step mandatory. Separating the live root from the offline package mirror in the official ISO may provide a middle ground. Do not describe Candidate C alone as removing the 6 GiB tmpfs cost.
 
 ### v1 decision
 
@@ -652,7 +665,7 @@ The app substitutes the real `OMARCHYINST` GPT GUID and a `copytoram_size` of `m
 | Filesystem | **FAT32** (files are kilobytes; the 4 GiB cap is irrelevant) |
 | Label | `cidata` (Windows Format may write `CIDATA`; the loader accepts both) |
 | Drive letter | None. Access via `\\?\Volume{GUID}\` |
-| ACL | Administrators + SYSTEM only. Treat as a **secret** (see encryption passphrase below) |
+| Windows exposure | Hidden + no-default-drive-letter. FAT32 cannot enforce an Administrators+SYSTEM DACL; treat it as a **secret** and delete it on abort. |
 | GPT name | `cidata` |
 
 Do not put cidata files on `OMARCHYINST` (NTFS, wrong label). Do not require an ISO patch to `omarchy-cidata-load`.
@@ -672,7 +685,7 @@ Do not put cidata files on `OMARCHYINST` (NTFS, wrong label). Do not require an 
 
 Password hashing: implement SHA-512 crypt in Rust (`$6$` + 16-char salt from `[a-zA-Z0-9./]`, same as `openssl passwd -6`). Do **not** require openssl on the user’s PATH. Zeroize the plaintext after hashing; **never write it to `state.json`**. `user_credentials.json` stores the hash as `root_enc_password` / `users[].enc_password` (same shape as `configurator` `write_user_files`).
 
-**LUKS passphrase honesty:** if encryption is on (v1 default, matching the ISO), the ISO’s `disk_encryption` block in `user_configuration.json` carries the passphrase in **plaintext**, and `user_credentials.json` has `"encryption_password"` in plaintext (`configurator` + ISO README). The cidata volume is therefore a **secret** until wipe: no drive letter, tight DACL, not copied to LocalAppData. Wipe deletes it. If the user aborts, rollback **deletes the cidata partition** (do not leave a plaintext LUKS passphrase on a FAT volume the next Windows boot could mount).
+**LUKS passphrase honesty:** if encryption is on (v1 default, matching the ISO), the ISO’s `disk_encryption` block in `user_configuration.json` carries the passphrase in **plaintext**, and `user_credentials.json` has `"encryption_password"` in plaintext (`configurator` + ISO README). The cidata volume is therefore a **secret** until wipe: hidden, no default drive letter, and not copied to LocalAppData. FAT32 provides no per-user ACL, and an administrator can deliberately mount it. Wipe deletes it. If the user aborts, rollback **deletes the cidata partition** (do not leave a plaintext LUKS passphrase on a FAT volume the next Windows boot could mount).
 
 ### `user_configuration.json` disk identity
 
@@ -684,11 +697,13 @@ v1 writes a **Linux persistent path** constructed from identifiers Windows can r
 2. Else NVMe EUI: `/dev/disk/by-id/nvme-eui.{eui}`.
 3. Else ATA: `/dev/disk/by-id/ata-{MODEL}_{SERIAL}` (spaces → `_`, udev’s usual mangling).
 
-Also record GPT **disk** GUID (`PTUUID`) and serial in `state.json` for the support bundle. The JSON `device` field is **one** of the by-id paths above — the path archinstall will open. PR 5b’s lab must boot the live ISO and assert that path exists (`test -b`) before claiming autoinstall works on that hardware class. If an OEM serial does not match udev, fix the mapping table in this app, not the ISO.
+Also record GPT **disk** GUID (`PTUUID`) and serial in `state.json` for the support bundle. The cidata JSON `device` field is **one** of the by-id paths above. The live orchestrator verifies that it resolves to a block device, preserves the stable path in its install context, and writes the canonical runtime path (for example `/dev/nvme0n1`) into the temporary config passed to archinstall. Archinstall 4.4 silently ignored a valid virtio by-id alias in the 7a lab, installed into the live `/mnt` tmpfs, and eventually failed with `Write failed`; passing canonical `/dev/vda` completed the install. PR 5b’s lab must therefore assert both that the by-id path exists (`test -b`) and that the transient archinstall config contains its canonical target before claiming autoinstall works on that hardware class. If an OEM serial does not match udev, fix the mapping table in this app, not the ISO.
 
 Layout template: copy the configurator’s full-disk document (`"mode": "full_disk"`, `"wipe": true`, 2 GiB ESP starting at 1 MiB, btrfs root filling the rest, `obj_id`s `ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d` / `8c2c2b92-1070-455d-b76a-56263bab24aa`). Sizes use the **whole disk** byte size from Windows (the wipe rebuilds the table from scratch; do not subtract `OMARCHYINST`). Kernel: `linux` for v1 Windows x86_64 (not `linux-t2`). Encryption block: same shape as the configurator when the user leaves encryption on.
 
 `"wipe": true` destroys ESP, MSR, C:, Recovery, `OMARCHYINST`, and `cidata`. **`copytoram=y` remains mandatory.**
+
+Encrypted installs remain the default and retain the mkinitcpio `encrypt` hook. For an explicit unencrypted install, the orchestrator removes only that hook before the final UKI build; otherwise mkinitcpio's legacy encrypt hook treats the ordinary `root=PARTUUID=…` value as an encrypted device, prints a false “not a LUKS volume” error, and then continues booting.
 
 ---
 
@@ -739,7 +754,7 @@ This repo can carry proposed patches under `references/omarchy-iso/` as a checko
 
 Rules:
 
-- Do **not** embed the 6 GB ISO in NSIS/MSI.
+- Do **not** embed the 6 GB ISO in the portable EXE.
 - Pin version and URL in a **Rust constant**, not a frontend string. Dest is `OMARCHYINST` (`\\?\Volume{GUID}\omarchy.iso`), not a path the UI supplies.
 - Resume via HTTP `Range` against that volume path.
 - sha256 is blocking. Parse the `.sha256` sidecar **in Rust**. Never take a hash from the frontend.
@@ -826,7 +841,7 @@ Rollback implementation lives in this app and reads `state.json`. It is a first-
 | Storage Spaces | Block |
 | Dual-disk (“wipe the other SSD”) | Out of scope |
 | ARM64 Windows | Out of scope (ISO is `arch="x86_64"`) |
-| < 16 GiB RAM | Block in **v1** (`copytoram=y`). **v1.1:** Candidate C for 8 GiB SKUs |
+| < 16 GiB RAM | Block in **v1** (`copytoram=y`). Future: measure a size-derived floor and investigate Candidate D (offline) or a small network-backed live environment (online). Candidate C alone does not reduce RAM use. |
 | BitLocker on, decrypting, or suspended | Block |
 | Secure Boot on | Block + firmware reboot offer |
 | Dual-boot as the product outcome | Out of scope |
@@ -956,6 +971,7 @@ pub struct MachineProbe {
     pub ram_ok_for_copytoram: bool, // installed >= 16 GiB && total_phys >= 14 GiB; NOT avail
     pub tpm_present: bool,          // informational; not a blocking reason
     pub recommended_disk_id: Option<String>, // Windows boot disk
+    pub target_esp: Option<TargetEsp>, // ESP proven to be on that same disk
     pub linux_by_id: Option<String>, // constructed /dev/disk/by-id/... for cidata JSON
     pub bitlocker: Vec<BitlockerVolume>,
     pub disks: Vec<DiskMap>,
@@ -972,6 +988,9 @@ pub enum BlockingReason {
     BitLocker { mount: Option<String> },
     Ram { have_installed: u64, have_total_phys: u64, need_installed: u64, need_total_phys: u64 },
     EfiVarsLocked,
+    ProbeIncomplete { component: String },
+    MissingEsp { disk_id: String },
+    AmbiguousEsp { disk_id: String, count: u32 },
     Rst { disk_id: String },
     Dynamic { disk_id: String },
     StorageSpaces { disk_id: String },
@@ -981,6 +1000,8 @@ pub enum BlockingReason {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BitlockerVolume {
+    pub device_id: Option<String>,  // Win32_EncryptableVolume.DeviceID
+    pub disk_id: Option<String>,    // associated target PhysicalDrive
     pub mount: Option<String>,
     pub protection_status: u32,
     pub conversion_status: u32,
@@ -1077,8 +1098,15 @@ pub struct RollbackResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateJournal {
-    pub version: u32,
-    pub step: JournalStep, // ProbeDone | Shrunk | IsoVerified | Staged | BootNextSet
+    pub version: u32, // schema 2; unknown versions are refused
+    pub operation_id: String,
+    pub step: JournalStep, // granular mutation/recovery checkpoint
+    pub pending_operation: Option<PendingOperation>,
+    pub target_disk_guid: Option<String>,
+    pub target_disk_number: Option<u32>,
+    pub windows_partition_guid: Option<String>,
+    pub esp_partition_guid: Option<String>,
+    pub esp_volume_guid: Option<String>,
     pub omarchyinst_guid: Option<String>,
     pub cidata_guid: Option<String>,
     pub linux_device: Option<String>,
@@ -1109,7 +1137,7 @@ No server, no database. Local state only:
 
 `state.json` is written **before** each mutating step and fsynced. Rollback is driven from it. After a successful Linux install this directory dies with Windows, which is correct.
 
-No migration: v1 is the first schema. If we change it, bump `version` and refuse to parse unknown journals rather than guessing.
+No migration: schema 2 is the first safety-complete schema. Schema 1 and unknown versions are refused rather than guessing destructive targets.
 
 There is **no** reboot-and-resume shrink flow in v1, so there is no “resume at download” step ID. If we add pagefile reboot later, that is a new `JournalStep` and a dedicated PR.
 
@@ -1146,18 +1174,19 @@ On non-Windows `tauri dev`, steps 1–4 render with stub probe data; mutate comm
 | **E** | Payload is the **ISO file on NTFS `OMARCHYINST`** (size formula) + **official `BOOTX64.EFI`** at `EFI/OmarchyInstall/` + **discovered search bait** (typically `/boot/<iso_uuid>.uuid`; **not** hardcoded `/.disk/`) + **our** `boot/grub/grub.cfg`. Not FAT32. Not a sibling grub.cfg the official binary ignores. | 4 GiB FAT32 cap; official GRUB embed searches the baked `ARCHISO_SEARCH_FILENAME` and loads `/boot/grub/grub.cfg` on that volume. mkarchiso **abandoned `/.disk/`** so a leading-dot dir is not missed when copying ISO contents. |
 | **F** | Loopback of the ISO is bootstrap-only. Loop of the installed OS is forbidden. | Wubi line. |
 | **G** | Prefer `BootNext`; never prepend `BootOrder`; never write `EFI/Microsoft` or `EFI/Boot/bootx64.efi`. Append-not-prepend is the OEM escape hatch if BootNext is ignored. | Failed attempt must still boot Windows. Cite `consumer-secure-boot.md` / `detect_windows_esp`. |
-| **H** | v1 **writes cidata** from the Windows wizard. Linux skips the configurator and autoinstalls full-disk (`wipe: true`). | Product call. Satisfy `omarchy-cidata-load` with a **second ~64 MiB FAT32 volume labeled `cidata`** (no ISO patch). Windows-side confirms are the only human gate. `defer-provisioning` is not v1 default. Secrets (LUKS passphrase in JSON) live on that volume until wipe; tight ACL, no drive letter. Disk path is Linux `/dev/disk/by-id/…`, not `PhysicalDriveN`. |
+| **H** | v1 **writes cidata** from the Windows wizard. Linux skips the configurator and autoinstalls full-disk (`wipe: true`). | Product call. Satisfy `omarchy-cidata-load` with a **second ~64 MiB FAT32 volume labeled `cidata`** (no ISO patch). Windows-side confirms are the only human gate. `defer-provisioning` is not v1 default. Secrets (LUKS passphrase in JSON) live on that volume until wipe; hidden + no-default-drive-letter, acknowledging that FAT32 has no ACL boundary. Disk path is Linux `/dev/disk/by-id/…`, not `PhysicalDriveN`. |
 | **I** | BitLocker: refuse unless `ProtectionStatus=0` **and** `ConversionStatus=0` on every encryptable volume on the disk. Re-probe before mutate. Rationale is shrink/ESP safety, not the free-space configurator abort. | Full-disk path never calls `detect_bitlocker`. |
 | **J** | Secure Boot: detect and block; offer firmware reboot. No shim in this app. Detect TPM and mention it; **do not block on TPM alone**. | ISO is unsigned GRUB today. Only SB off is required. |
 | **J2** | Intel RST / VMD: **always block** in v1. | RAID metadata is out of scope. |
 | **K** | ISO is downloaded at runtime **onto `OMARCHYINST`**, not bundled, not double-copied under LocalAppData. sha256 and **GPG are blocking**. URL pinned in Rust. | Supply chain. Peak free space is the hole we just created. |
 | **L** | Dual-boot is out of v1. Cidata JSON is full-disk `"wipe": true` only. | Product is replacement. Configurator is skipped. |
-| **L2** | Authenticode of NSIS/MSI is deferred until first public release. | Dogfood unsigned internally. Not a probe/wizard/lab blocker. |
-| **L3** | v1 RAM floor is 16 GiB installed. **v1.1** is Candidate C for 8 GiB SKUs. | Scheduled follow-up, not a forever non-goal. |
+| **L2** | Authenticode of the portable EXE is deferred until first public release. | Dogfood unsigned internally. Not a probe/wizard/lab blocker. |
+| **L3** | v1 RAM floor is 16 GiB installed, but it is provisional. Future lower-memory work investigates a measured size-derived gate, Candidate D for offline installs, or a small online live environment. Candidate C alone retains the same RAM cost. | Avoid making a conservative implementation constraint a permanent hardware requirement. |
 | **M** | Dev-on-Linux, production-on-Windows. Download/verify run on stub hosts; mutate does not. | Already the repo’s layout. |
 | **N** | Last safe rollback is **before reboot into cidata autoinstall**. After the orchestrator starts `wipe: true`, we are honest, not heroic. | Linux no longer shows `confirm_disk_overwrite`. |
 | **O** | v1 does not reboot-and-resume for pagefile. Fail on unmovable files. Restore Fast Startup/hibernation on abort. | Half-applied power settings across a Windows reboot is a second product. |
-| **P** | Packed app is `requireAdministrator` via `src-tauri/windows.manifest`; unpackaged/`tauri dev` gets `runas` relaunch. NSIS `both` stays. | Detection without enforcement is how we ship unelevated. |
+| **P** | Portable app is `requireAdministrator` via `src-tauri/windows.manifest`; unpackaged/`tauri dev` gets `runas` relaunch. There is no app installer or uninstaller. | Detection without enforcement is how we ship unelevated. |
+| **Q** | If WebView2 cannot initialize, the EXE serves its embedded UI on an authenticated random loopback port and opens the default browser. | Keeps the release single-file without installing or bundling a browser runtime. |
 
 ---
 
@@ -1226,11 +1255,11 @@ Closest prior art for “ISO file on a partition + GRUB + `img_loop`.”
 | Overwriting `EFI/Microsoft` | High | Path allow-list: `EFI/OmarchyInstall/`, `boot/grub/grub.cfg`, and the **journaled** search-bait path. Tests assert Microsoft still exists on abort |
 | Permanent BootOrder hijack | High | Do not prepend. BootNext; append-only escape hatch |
 | BitLocker recovery hell / half-encrypted shrink | High | Refuse unless ConversionStatus 0; re-probe before mutate |
-| Credentials / LUKS passphrase on cidata | High | FAT `cidata` volume, no drive letter, Administrators+SYSTEM DACL. Hash `$6$` in Rust; **no plaintext in `state.json`**. ISO still puts LUKS passphrase in JSON plaintext — delete the volume on abort; wipe destroys it on success. |
+| Credentials / LUKS passphrase on cidata | High | FAT `cidata` volume is hidden and has no default drive letter; FAT32 has no ACL security boundary. Hash `$6$` in Rust; **no plaintext in `state.json`**. ISO still puts the LUKS passphrase in JSON plaintext — delete the volume on abort; wipe destroys it on success. |
 | Intel RST / VMD | High | Always block (`BlockingReason::Rst`). No install onto RAID metadata. |
 | Support bundle leaking hostname / disk serials | Low | Include them (needed to debug); user-initiated upload only |
 | Running un-elevated and failing midway | Medium | `windows.manifest` requireAdministrator + `runas` relaunch |
-| Supply chain of *this* app (NSIS) | Medium | Authenticode **deferred until first public release**. Dogfood unsigned internally. Not a blocker for probe/wizard/lab. |
+| Supply chain of *this* app (portable EXE) | Medium | Authenticode **deferred until first public release**. Dogfood unsigned internally. Not a blocker for probe/wizard/lab. |
 
 We never need the user’s Microsoft account. We never send disk contents off-box unless the user exports a support bundle.
 
@@ -1260,8 +1289,8 @@ Support bundle (`export_support_bundle`): zip of logs + redacted `state.json` + 
   2. **PR 7a lab** on QEMU / spare hardware with official 4.0.2 **before any shrink code merges.**
   3. Dev: Windows VM with nested UEFI, unencrypted test disk.
   4. Dogfood on a spare laptop with a known-good USB as the recovery path.
-  5. Private MSI, then public NSIS/MSI.
-- **Rollback of the app itself:** Windows uninstall. That does not restore a wiped disk.
+  5. Private portable EXE, then Authenticode-signed public EXE.
+- **Rollback of the app itself:** delete the portable EXE. That does not restore a wiped disk; `%LOCALAPPDATA%\OmarchyInstall` may retain logs, cached downloads, and recovery state.
 - **ISO version pin:** bump in a dedicated PR when 4.0.3 ships.
 - **ISO patches:** if 7a fails, they ship in an Omarchy ISO release *before* we tell users this app works. This app then requires “ISO ≥ that version.”
 
@@ -1297,7 +1326,7 @@ Support bundle (`export_support_bundle`): zip of logs + redacted `state.json` + 
 
 1. ~~cidata vs interactive configurator.~~ **Closed:** cidata autoinstall from the Windows wizard (Decision H). Second FAT volume labeled `cidata`; no ISO patch.
 2. **If GRUB-on-NTFS or initramfs-on-NTFS is a field disaster, do we:** (a) exFAT (same module question), (b) split the ISO in an official rebuild so the squashfs is < 4 GiB and the mirror is loose files, (c) require USB after all?
-3. ~~RAM gate.~~ **Closed:** v1 hard-gates 16 GiB installed / ~14 GiB `ullTotalPhys`. **v1.1** is Candidate C for 8 GiB SKUs (scheduled, not rejected). `ullAvailPhys` is not a gate.
+3. ~~RAM gate for v1.~~ **Closed for v1 only:** hard-gate 16 GiB installed / ~14 GiB `ullTotalPhys`; `ullAvailPhys` is not a gate. **Open for later releases:** validate a size-derived floor and choose between Candidate D (offline), a network-backed installer, or an ISO split between the live root and offline mirror. Candidate C alone cannot support 8 GiB because it retains the ~6 GiB tmpfs copy.
 4. ~~HOOKS order / whether to patch `loopback.cfg`.~~ **Closed:** HOOKS order is not the risk; we write our own `boot/grub/grub.cfg` with `copytoram=y`. Remaining lab is NTFS + unmount.
 5. **How do we discover “latest ISO”?** Pin 4.0.2 until `iso.omarchy.org` publishes a signed `latest.json`. Do not scrape HTML.
 6. ~~GPG blocking vs warn-only.~~ **Closed:** blocking, pinned key, rotation = app release.
@@ -1364,7 +1393,7 @@ Incremental PRs against this Tauri repo. **No mutate-capable merge until PR 7a�
 - `src/types.ts`, `src/App.tsx` — show probe fields; “Relaunch as Administrator” when `elevated == false`
 - Tests: stub path; `require_windows` still holds for Win32 commands
 
-**Description:** Read-only except the relaunch. **RST is a blocking reason, always.** TPM present is a probe field, not a block. Construct `linux_by_id` from WWN/EUI/serial for later cidata. NSIS `installMode: "both"` unchanged. Linux `tauri dev` keeps working.
+**Description:** Read-only except the relaunch. **RST is a blocking reason, always.** TPM present is a probe field, not a block. Construct `linux_by_id` from WWN/EUI/serial for later cidata. Portable `requireAdministrator` behavior remains unchanged. Linux `tauri dev` keeps working.
 
 ---
 
@@ -1461,7 +1490,7 @@ Incremental PRs against this Tauri repo. **No mutate-capable merge until PR 7a�
 
 - New `src-tauri/src/cidata.rs` — SHA-512 crypt (`$6$`) compatible with `openssl passwd -6`; emit `user_configuration.json` from the configurator full-disk template (`wipe: true`, 2 GiB ESP, whole-disk sizes, `device` = Linux `/dev/disk/by-id/…`); emit `user_credentials.json`; optional `user_full_name.txt` / `user_email_address.txt` / `user_encrypt_installation.txt`
 - `commands.rs` — `write_cidata(CidataIdentity)`
-- DACL + no drive letter on the cidata volume
+- Hidden + no-default-drive-letter attributes on the cidata volume; document that FAT32 cannot enforce an ACL
 - Tests: hash verifies with a known `openssl passwd -6` vector; JSON has `"wipe": true` and `"mode": "full_disk"`; no plaintext password in `state.json`; encryption JSON contains passphrase only on the cidata volume; device path is `/dev/disk/by-id/`, not `PhysicalDrive`
 - Lab: boot official ISO with a fixture `cidata` volume and assert `omarchy-cidata-load` skips the configurator and `test -b` the by-id path
 

@@ -1,0 +1,62 @@
+# Production is one portable x64 executable. Do not recurse submodules:
+# `references/` is embedded neither in the executable nor in the artifact.
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Portable EXE
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Rust tests
+        run: bun run check:rust
+
+      - name: Build portable executable
+        run: bun run tauri:build
+
+      - name: Verify portable dependencies
+        shell: pwsh
+        run: |
+          $imports = dumpbin /DEPENDENTS src-tauri/target/release/OmarchyInstaller.exe | Out-String
+          if ($imports -match '(?i)VCRUNTIME|MSVCP|WebView2Loader\.dll') {
+            throw "Portable executable has an unexpected runtime dependency:`n$imports"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OmarchyInstaller-windows-x64
+          path: src-tauri/target/release/OmarchyInstaller.exe
+          if-no-files-found: error

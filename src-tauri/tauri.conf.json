@@ -13,38 +13,40 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Omarchy Install",
-        "width": 960,
-        "height": 680,
-        "minWidth": 720,
-        "minHeight": 480
+        "width": 1024,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 560,
+        "center": true,
+        "backgroundColor": "#1a1b26",
+        "theme": "Dark",
+        "decorations": false,
+        "shadow": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost https://ipc.localhost; font-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {
-    "active": true,
-    "targets": ["nsis", "msi"],
+    "active": false,
     "category": "Utility",
-    "shortDescription": "Windows installer",
+    "publisher": "Jonathan",
+    "copyright": "Copyright 2026 Jonathan",
+    "shortDescription": "Install Omarchy from Windows without a USB stick",
+    "longDescription": "Windows-to-Omarchy without a USB stick. Stages a real installer partition, reboots into the official Omarchy ISO, and that installer replaces Windows.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "windows": {
-      "nsis": {
-        "installMode": "both",
-        "installerIcon": "icons/icon.ico"
-      },
-      "webviewInstallMode": {
-        "silent": true,
-        "type": "downloadBootstrapper"
-      }
-    }
+    ]
   }
 }

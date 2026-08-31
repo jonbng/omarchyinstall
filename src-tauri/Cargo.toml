@@ -1,15 +1,19 @@
 [package]
 name = "omarchyinstall"
 version = "0.1.0"
-description = "Windows desktop installer (Tauri 2). Dev on macOS/Linux, production on Windows."
-authors = ["you"]
+description = "Portable Windows-to-Omarchy bootstrap app (Tauri 2)."
+authors = ["Jonathan"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.80"
 
 [lib]
 # Unique lib name so it does not collide with the Windows exe (rust-lang/cargo#8519).
 name = "omarchyinstall_lib"
 crate-type = ["rlib"]
+
+[[bin]]
+name = "OmarchyInstaller"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -22,6 +26,21 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+axum = "0.8"
+getrandom = "0.3"
+sha2 = "0.10"
+anyhow = "1"
+tokio = { version = "1", features = ["sync", "time", "net", "rt-multi-thread"] }
+sha-crypt = "0.5"
+zeroize = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+sequoia-openpgp = { version = "1.22", default-features = false, features = [
+    "crypto-rust",
+    "allow-experimental-crypto",
+    "allow-variable-time-crypto",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -29,9 +48,13 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_IO",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
