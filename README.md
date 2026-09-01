@@ -37,10 +37,10 @@ Intel RST/VMD/RAID, Dynamic Disks, Storage Spaces, legacy BIOS, and ARM Windows 
 ## Install Omarchy
 
 1. Back up all files from the Windows PC and keep any BitLocker recovery keys somewhere off the PC.
-2. Fully decrypt BitLocker-protected volumes and disable Secure Boot in the PC's firmware settings.
+2. Disable Secure Boot in the PC's firmware settings. Fully decrypting BitLocker-protected volumes is strongly recommended; you may continue without doing so after acknowledging the recovery and rollback risk.
 3. Download `OmarchyInstaller-windows-x64.exe` from the [latest GitHub Release](https://github.com/jonbng/omarchyinstall/releases/latest).
 4. Optionally verify the download against the accompanying `.sha256` file.
-5. Right-click the executable and choose **Run as administrator**. The executable is portable; there is no setup program to install.
+5. Open the executable normally and approve the Administrator prompt. The executable requests elevation automatically and is portable; there is no setup program to install.
 6. Follow the wizard, review the selected disk carefully, and enter `ERASE WINDOWS` only when you are ready for that disk to be erased.
 7. Leave the PC connected to power and the network while the ISO is downloaded, verified, and staged.
 8. At the final prompt, reboot into the installer. Once the live Omarchy installer starts, the Windows installation cannot be recovered by this app.

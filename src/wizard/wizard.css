@@ -26,14 +26,7 @@
 .step-dot { width: 1.35rem; height: 1.35rem; display: grid; place-items: center; border: 1px solid var(--line); font-size: .62rem; font-variant-numeric: tabular-nums; }
 .crumbs li.done .step-dot { border-color: rgb(var(--rgb-green) / .4); color: var(--green); }
 .crumbs li.current .step-dot { border-color: var(--green); background: var(--green); color: var(--bg); }
-.window-controls { height: 100%; display: flex; align-items: stretch; -webkit-app-region: no-drag; app-region: no-drag; }
-.window-control { appearance: none; width: 3rem; min-height: 100%; padding: 0; border: 0; border-left: 1px solid rgb(var(--rgb-term-black) / .28); display: grid; place-items: center; background: transparent; color: var(--muted); font: inherit; cursor: default; transition: color 120ms var(--ease-out), background 120ms var(--ease-out); }
-.window-control > span { display: block; }
-.minimize-icon { width: .7rem; height: 1px; background: currentColor; transform: translateY(.25rem); }
-.maximize-icon { width: .68rem; height: .68rem; border: 1px solid currentColor; }
-.restore-icon { position: relative; width: .62rem; height: .62rem; border: 1px solid currentColor; transform: translate(-.1rem, .1rem); }
-.restore-icon::before { content: ""; position: absolute; width: .55rem; height: .55rem; left: .16rem; bottom: .16rem; border: 1px solid currentColor; border-left: 0; border-bottom: 0; }
-.close-control > span { font-size: 1.1rem; line-height: 1; transform: translateY(-.04rem); }
+.abort-btn { appearance: none; height: 100%; padding: 0 1.35rem; border: 0; border-left: 1px solid rgb(var(--rgb-term-black) / .28); background: transparent; color: var(--muted); font: inherit; font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; cursor: pointer; -webkit-app-region: no-drag; app-region: no-drag; transition: color 120ms var(--ease-out), background 120ms var(--ease-out); }
 .stage { min-height: 0; overflow: auto; padding: 3rem 2rem 2.25rem; scrollbar-color: var(--line) transparent; }
 .stage-body { width: 100%; max-width: 58rem; min-height: 100%; margin: 0 auto; display: grid; align-content: center; }
 .stage > .banner { max-width: 58rem; margin: 0 auto 1rem; }
@@ -203,8 +196,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
   .btn.primary:hover:not(:disabled) { background: var(--turquoise); }
   .btn.danger:hover:not(:disabled) { background: var(--orange); }
   .btn.ghost:hover:not(:disabled) { border-color: rgb(var(--rgb-white) / .35); color: var(--fg); }
-  .window-control:hover { background: rgb(var(--rgb-white) / .08); color: var(--fg); }
-  .window-control.close-control:hover { background: var(--red); color: var(--bg); }
+  .abort-btn:hover { background: var(--red); color: var(--bg); }
   .crumbs li.done button:hover { color: var(--green); }
   .choice:hover { border-color: rgb(var(--rgb-white) / .3); }
   .picker-toggle:hover { color: var(--turquoise); }

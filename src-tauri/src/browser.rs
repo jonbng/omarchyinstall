@@ -68,22 +68,13 @@ pub fn launch(app: &AppHandle, webview_error: &str) -> Result<(), String> {
     let address = std_listener
         .local_addr()
         .map_err(|e| format!("read browser fallback address: {e}"))?;
-    let configured_token = if cfg!(debug_assertions) {
-        std::env::var("OMARCHY_TEST_BROWSER_TOKEN").ok()
-    } else {
-        None
-    };
-    let token = if let Some(token) = configured_token {
-        token
-    } else {
-        let mut token_bytes = [0u8; 32];
-        getrandom::fill(&mut token_bytes)
-            .map_err(|e| format!("create browser session token: {e}"))?;
-        token_bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
+    let mut token_bytes = [0u8; 32];
+    getrandom::fill(&mut token_bytes)
+        .map_err(|e| format!("create browser session token: {e}"))?;
+    let token = token_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let origin = format!("http://127.0.0.1:{}", address.port());
     let (event_tx, _) = broadcast::channel(64);
     let state = BrowserState {

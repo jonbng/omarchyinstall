@@ -41,10 +41,10 @@ import {
 } from "./bridge";
 import { previewProbe, runningOutsideTauri } from "./preview";
 import {
+  AbortButton,
   AbortDialog,
   closeWindow,
-  handleTitlebarMouseDown,
-  WindowControls,
+  startTitlebarDrag,
 } from "./TitleControls";
 import { KEYBOARDS, TIMEZONES, TIMEZONE_OPTIONS } from "./options";
 import { SearchPicker } from "./SearchPicker";
@@ -436,7 +436,7 @@ export default function Wizard() {
           const target = event.target as HTMLElement;
           if (target.closest("button, input, a, select, summary, [data-no-drag]")) return;
           event.preventDefault();
-          void handleTitlebarMouseDown(event.detail).catch(() => undefined);
+          void startTitlebarDrag().catch(() => undefined);
         }}
       >
         <div className="waybar-left" data-tauri-drag-region>
@@ -462,8 +462,8 @@ export default function Wizard() {
           })}
         </ol>
         <div className="waybar-right">
-          <WindowControls
-            onClose={() => {
+          <AbortButton
+            onClick={() => {
               setAbortError(null);
               setAbortOpen(true);
             }}

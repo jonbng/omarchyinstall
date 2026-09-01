@@ -122,9 +122,19 @@ pub fn export_support_bundle() -> Result<std::path::PathBuf> {
 
 fn os_version() -> Option<String> {
     let key = w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
-    let product = reg_sz(key, w!("ProductName"))?;
+    let mut product = reg_sz(key, w!("ProductName"))?;
     let display = reg_sz(key, w!("DisplayVersion"));
     let build = reg_sz(key, w!("CurrentBuildNumber"));
+
+    // Windows 11 intentionally retains "Windows 10" in this registry value
+    // for application compatibility. The build number is the reliable split.
+    if build
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|value| value >= 22_000)
+    {
+        product = product.replacen("Windows 10", "Windows 11", 1);
+    }
 
     match (display, build) {
         (Some(display), Some(build)) => Some(format!("{product} {display} (build {build})")),
