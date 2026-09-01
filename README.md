@@ -28,6 +28,8 @@ Upstream checkouts, tracked as submodules:
 | `references/omarchy-iso` | [omacom/omarchy-iso](https://github.com/omacom/omarchy-iso) | `quattro` |
 | `references/omarchy-site` | [omacom/omarchy-site](https://github.com/omacom/omarchy-site) | `master` |
 
+Related-project observations are recorded in [docs/PRIOR_ART_WUBIUEFI_INSTLUX.md](docs/PRIOR_ART_WUBIUEFI_INSTLUX.md). These are research notes, not endorsed designs or implementation decisions.
+
 ## Dev
 
 ```sh

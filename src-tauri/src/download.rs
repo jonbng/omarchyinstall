@@ -12,7 +12,7 @@ use sequoia_openpgp::parse::stream::{
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::Cert;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
@@ -43,6 +43,19 @@ pub struct VerifyResult {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalIsoSelection {
+    pub path: PathBuf,
+    pub filename: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalIsoSource {
+    path: PathBuf,
+}
+
 pub struct IsoPaths {
     pub iso: PathBuf,
     pub sha256: PathBuf,
@@ -68,6 +81,10 @@ pub fn iso_cache_dir() -> Result<PathBuf> {
 
 fn resolved_path(dir: &Path) -> PathBuf {
     dir.join("resolved.json")
+}
+
+fn local_source_path(dir: &Path) -> PathBuf {
+    dir.join("local-source.json")
 }
 
 pub fn load_resolved_release() -> Result<Option<IsoRelease>> {
@@ -105,7 +122,95 @@ pub fn iso_paths() -> Result<IsoPaths> {
     let rel = load_resolved_release()?.ok_or_else(|| {
         Error::Message("no resolved ISO yet; download_iso first (latest GitHub release)".into())
     })?;
-    iso_paths_for(&rel)
+    let mut paths = iso_paths_for(&rel)?;
+    let source_path = local_source_path(&iso_cache_dir()?);
+    match fs::read(&source_path) {
+        Ok(body) => {
+            let source: LocalIsoSource = serde_json::from_slice(&body)
+                .map_err(|e| Error::Message(format!("local-source.json: {e}")))?;
+            paths.iso = source.path;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(paths)
+}
+
+fn release_from_local_path(path: &Path) -> Result<IsoRelease> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Message("the selected ISO filename is not valid UTF-8".into()))?;
+    let version = filename
+        .strip_prefix("omarchy-")
+        .and_then(|name| name.strip_suffix(".iso"))
+        .filter(|version| {
+            !version.is_empty()
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        })
+        .ok_or_else(|| {
+            Error::Message(
+                "select an official ISO named omarchy-<version>.iso (for example omarchy-3.0.2.iso)"
+                    .into(),
+            )
+        })?;
+    Ok(IsoRelease::from_version(version))
+}
+
+/// Select an already downloaded official ISO without copying the multi-gigabyte file.
+/// Signed sidecars next to it are reused; otherwise only the small official sidecars are fetched.
+pub async fn prepare_local_iso(path: &Path) -> Result<LocalIsoSelection> {
+    let _guard = download_lock().lock().await;
+    let path = fs::canonicalize(path)
+        .map_err(|e| Error::Message(format!("cannot open selected ISO: {e}")))?;
+    if !path.is_file() {
+        return Err(Error::Message("the selected ISO is not a file".into()));
+    }
+    let rel = release_from_local_path(&path)?;
+    let bytes = fs::metadata(&path)?.len();
+    if bytes == 0 {
+        return Err(Error::Message("the selected ISO is empty".into()));
+    }
+
+    let cache = iso_paths_for(&rel)?;
+    let sibling_sha = path.with_file_name(format!("{}.sha256", rel.filename));
+    let sibling_sig = path.with_file_name(format!("{}.sig", rel.filename));
+    let client = client()?;
+    let sha = if sibling_sha.is_file() {
+        fs::read(&sibling_sha)?
+    } else {
+        fetch_bytes(&client, &rel.sha256_url()).await?
+    };
+    // Reject malformed checksum metadata before making this source active.
+    parse_sha256_sidecar(
+        std::str::from_utf8(&sha)
+            .map_err(|_| Error::Message("ISO .sha256 sidecar is not valid UTF-8".into()))?,
+    )?;
+    let sig = if sibling_sig.is_file() {
+        fs::read(&sibling_sig)?
+    } else {
+        fetch_bytes(&client, &rel.sig_url()).await?
+    };
+    if sig.is_empty() {
+        return Err(Error::Message("ISO .sig was empty".into()));
+    }
+
+    fs::write(&cache.sha256, sha)?;
+    fs::write(&cache.sig, sig)?;
+    save_resolved_release(&rel)?;
+    fs::write(
+        local_source_path(&iso_cache_dir()?),
+        serde_json::to_vec_pretty(&LocalIsoSource { path: path.clone() })
+            .map_err(|e| Error::Message(e.to_string()))?,
+    )?;
+    log::info!("using local ISO {}", path.display());
+    Ok(LocalIsoSelection {
+        path,
+        filename: rel.filename,
+        bytes,
+    })
 }
 
 pub async fn resolve_iso_release(client: &reqwest::Client) -> Result<IsoRelease> {
@@ -278,6 +383,12 @@ pub async fn download_iso_files(mut on_progress: impl FnMut(IsoProgress)) -> Res
     let _guard = download_lock().lock().await;
     let client = client()?;
     let rel = resolve_iso_release(&client).await?;
+    let local = local_source_path(&iso_cache_dir()?);
+    if let Err(e) = fs::remove_file(local) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.into());
+        }
+    }
     save_resolved_release(&rel)?;
     let paths = iso_paths_for(&rel)?;
 
@@ -488,6 +599,20 @@ mod tests {
     fn rejects_short_sidecar() {
         assert!(parse_sha256_sidecar("deadbeef  file\n").is_err());
         assert!(parse_sha256_sidecar("").is_err());
+    }
+
+    #[test]
+    fn local_iso_filename_resolves_the_matching_official_release() {
+        let rel = release_from_local_path(Path::new("/downloads/omarchy-3.0.2.iso")).unwrap();
+        assert_eq!(rel.version, "3.0.2");
+        assert_eq!(rel.filename, "omarchy-3.0.2.iso");
+        assert_eq!(rel.url, "https://iso.omarchy.org/omarchy-3.0.2.iso");
+    }
+
+    #[test]
+    fn local_iso_filename_rejects_renamed_or_unsafe_files() {
+        assert!(release_from_local_path(Path::new("download.iso")).is_err());
+        assert!(release_from_local_path(Path::new("omarchy-bad?.iso")).is_err());
     }
 
     #[test]

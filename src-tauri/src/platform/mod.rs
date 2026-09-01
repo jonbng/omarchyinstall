@@ -232,6 +232,10 @@ pub fn load_install_state() -> crate::error::Result<Option<StateJournal>> {
     imp::load_install_state()
 }
 
+pub fn pick_local_iso() -> crate::error::Result<Option<std::path::PathBuf>> {
+    imp::pick_local_iso()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepareResult {
@@ -275,8 +279,8 @@ pub struct RollbackResult {
     pub restored_power_settings: bool,
 }
 
-pub fn prepare_installer_partition() -> crate::error::Result<PrepareResult> {
-    imp::prepare_installer_partition()
+pub fn prepare_installer_partition(allow_bitlocker: bool) -> crate::error::Result<PrepareResult> {
+    imp::prepare_installer_partition(allow_bitlocker)
 }
 
 pub fn stage_bootloader() -> crate::error::Result<StageResult> {

@@ -104,8 +104,14 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
     })
 }
 
-pub fn prepare_installer_partition() -> Result<PrepareResult> {
+pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
     let probe = crate::platform::probe_machine()?;
+    if probe.bitlocker.iter().any(|volume| !volume.fully_decrypted) && !allow_bitlocker {
+        return Err(Error::Message(
+            "BitLocker is still enabled. Turn it off (recommended), or explicitly accept the BitLocker recovery risk before continuing."
+                .into(),
+        ));
+    }
     let existing = load_journal()?;
     let has_started = existing
         .as_ref()

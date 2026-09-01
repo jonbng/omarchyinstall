@@ -1,5 +1,5 @@
 use crate::cidata::CidataIdentity;
-use crate::download::{self, VerifyResult};
+use crate::download::{self, LocalIsoSelection, VerifyResult};
 use crate::error::Result;
 use crate::platform::{
     self, BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
@@ -55,6 +55,16 @@ pub async fn download_iso(app: tauri::AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
+pub fn pick_local_iso() -> Result<Option<std::path::PathBuf>> {
+    platform::pick_local_iso()
+}
+
+#[tauri::command]
+pub async fn prepare_local_iso(path: std::path::PathBuf) -> Result<LocalIsoSelection> {
+    download::prepare_local_iso(&path).await
+}
+
+#[tauri::command]
 pub fn verify_iso(app: tauri::AppHandle) -> Result<VerifyResult> {
     let emit = |progress| {
         let _ = app.emit("iso://progress", &progress);
@@ -69,8 +79,8 @@ pub fn verify_iso(app: tauri::AppHandle) -> Result<VerifyResult> {
 }
 
 #[tauri::command]
-pub fn prepare_installer_partition() -> Result<PrepareResult> {
-    platform::prepare_installer_partition()
+pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
+    platform::prepare_installer_partition(allow_bitlocker)
 }
 
 #[tauri::command]

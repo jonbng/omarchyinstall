@@ -3,6 +3,7 @@ import type {
   CidataIdentity,
   DiskMap,
   IsoProgress,
+  LocalIsoSelection,
   MachineProbe,
   PartitionMap,
   StateJournal,
@@ -42,6 +43,9 @@ import "./wizard.css";
 
 const STEPS = ["Welcome", "Machine", "Identity", "Backup", "Confirm", "Install"] as const;
 type Step = (typeof STEPS)[number];
+
+const GIB = 1024 ** 3;
+const RAM_RECOMMENDED = 14 * GIB;
 
 const STEP_SLUG: Record<Step, string> = {
   Welcome: "welcome",
@@ -106,6 +110,8 @@ export default function Wizard() {
   const [password2, setPassword2] = useState("");
   const [eraseInput, setEraseInput] = useState("");
   const [secondConfirm, setSecondConfirm] = useState(false);
+  const [bitlockerRiskAccepted, setBitlockerRiskAccepted] = useState(false);
+  const [localIsoPath, setLocalIsoPath] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [journal, setJournal] = useState<StateJournal | null>(null);
@@ -179,6 +185,8 @@ export default function Wizard() {
   }, []);
 
   const blocked = (probe?.blockingReasons.length ?? 0) > 0;
+  const bitlockerActive =
+    probe?.bitlocker.some((volume) => !volume.fullyDecrypted) ?? false;
   const native = probe?.host.nativeWindows ?? false;
   const identityOk = identityFieldsOk(
     identity.username,
@@ -194,7 +202,7 @@ export default function Wizard() {
       case "Welcome":
         return true;
       case "Machine":
-        return !!probe && !blocked && !probing;
+        return !!probe && !blocked && !probing && (!bitlockerActive || bitlockerRiskAccepted);
       case "Identity":
         return identityOk;
       case "Backup":
@@ -204,7 +212,7 @@ export default function Wizard() {
       case "Install":
         return false;
     }
-  }, [step, probe, blocked, probing, identityOk, eraseOk, secondConfirm]);
+  }, [step, probe, blocked, probing, bitlockerActive, bitlockerRiskAccepted, identityOk, eraseOk, secondConfirm]);
 
   function goTo(name: Step) {
     const next = STEPS.indexOf(name);
@@ -408,6 +416,8 @@ export default function Wizard() {
               onRetry={() => void loadProbe()}
               onRelaunch={() => void onRelaunch()}
               onFirmware={() => void onFirmware()}
+              bitlockerRiskAccepted={bitlockerRiskAccepted}
+              onBitlockerRiskAccepted={setBitlockerRiskAccepted}
             />
           )}
           {step === "Identity" && (
@@ -427,6 +437,12 @@ export default function Wizard() {
               secondConfirm={secondConfirm}
               onEraseInput={setEraseInput}
               onSecondConfirm={setSecondConfirm}
+              localIsoPath={localIsoPath}
+              onLocalIsoPath={(path) => {
+                setLocalIsoPath(path);
+                setSecondConfirm(false);
+              }}
+              bitlockerActive={bitlockerActive}
             />
           )}
           {step === "Install" && (
@@ -434,6 +450,8 @@ export default function Wizard() {
               native={native}
               identity={identity}
               journal={journal}
+              localIsoPath={localIsoPath}
+              allowBitlocker={bitlockerActive && bitlockerRiskAccepted}
               onStatus={(next) => {
                 setInstallPhase(next.phase);
                 setInstallReady(next.ready);
@@ -548,18 +566,24 @@ type CheckRow = {
   state: "ok" | "fail" | "warn";
 };
 
+function bitlockerOk(probe: MachineProbe): boolean {
+  return probe.bitlocker.length === 0 || probe.bitlocker.every((volume) => volume.fullyDecrypted);
+}
+
 function machineChecks(probe: MachineProbe): CheckRow[] {
   const boot =
     probe.disks.find((d) => d.deviceId === probe.recommendedDiskId) ??
     probe.disks.find((d) => d.isBoot);
-  const bitlockerOk =
-    probe.bitlocker.length === 0 || probe.bitlocker.every((v) => v.fullyDecrypted);
+  const isBitlockerOk = bitlockerOk(probe);
   const gptOk = (boot?.partitionStyle ?? "").toLowerCase() === "gpt";
   const elevatedOk = probe.host.elevated || !probe.host.nativeWindows;
   const efiOk = probe.efiVarsWritable || !probe.host.nativeWindows;
   const rst = probe.disks.some((d) => d.isRst);
   const dynamic = probe.disks.some((d) => d.isDynamic);
   const spaces = probe.disks.some((d) => d.isStorageSpaces);
+  const lowMemory =
+    probe.ramOkForCopytoram &&
+    (probe.ramInstalledBytes < RAM_RECOMMENDED || probe.ramTotalPhysBytes < RAM_RECOMMENDED);
 
   const rows: CheckRow[] = [
     {
@@ -583,14 +607,14 @@ function machineChecks(probe: MachineProbe): CheckRow[] {
     {
       id: "ram",
       label: "ram",
-      detail: `${formatBytes(probe.ramInstalledBytes)} installed · ${formatBytes(probe.ramTotalPhysBytes)} usable`,
-      state: probe.ramOkForCopytoram ? "ok" : "fail",
+      detail: `${formatBytes(probe.ramInstalledBytes)} installed · ${formatBytes(probe.ramTotalPhysBytes)} usable${lowMemory ? " · 14 GiB recommended" : ""}`,
+      state: probe.ramOkForCopytoram ? (lowMemory ? "warn" : "ok") : "fail",
     },
     {
       id: "bitlocker",
       label: "bitlocker",
-      detail: bitlockerOk ? "fully decrypted" : "still encrypting",
-      state: bitlockerOk ? "ok" : "fail",
+      detail: isBitlockerOk ? "fully decrypted" : "enabled — turn off recommended",
+      state: isBitlockerOk ? "ok" : "warn",
     },
     {
       id: "admin",
@@ -643,6 +667,8 @@ function ProbeStep({
   onRetry,
   onRelaunch,
   onFirmware,
+  bitlockerRiskAccepted,
+  onBitlockerRiskAccepted,
 }: {
   probe: MachineProbe | null;
   probing: boolean;
@@ -652,6 +678,8 @@ function ProbeStep({
   onRetry: () => void;
   onRelaunch: () => void;
   onFirmware: () => void;
+  bitlockerRiskAccepted: boolean;
+  onBitlockerRiskAccepted: (accepted: boolean) => void;
 }) {
   if (probing && !probe) {
     return (
@@ -674,7 +702,10 @@ function ProbeStep({
   }
   if (!probe) return null;
 
-  const availWarn = probe.ramOkForCopytoram && probe.ramAvailBytes < 10 * 1024 ** 3;
+  const availWarn = probe.ramOkForCopytoram && probe.ramAvailBytes < 10 * GIB;
+  const lowMemoryWarn =
+    probe.ramOkForCopytoram &&
+    (probe.ramInstalledBytes < RAM_RECOMMENDED || probe.ramTotalPhysBytes < RAM_RECOMMENDED);
   const boot =
     probe.disks.find((d) => d.deviceId === probe.recommendedDiskId) ??
     probe.disks.find((d) => d.isBoot);
@@ -702,6 +733,12 @@ function ProbeStep({
       </ul>
 
       <div className="probe-side">
+        {lowMemoryWarn && (
+          <p className="note">
+            Installation is allowed, but systems below 14 GiB RAM have less headroom
+            while the live installer is copied into memory and may run out of RAM.
+          </p>
+        )}
         {availWarn && (
           <p className="note">
             Windows currently has {formatBytes(probe.ramAvailBytes)} free. That does
@@ -710,6 +747,26 @@ function ProbeStep({
         )}
         {boot && <DiskCard disk={boot} linuxById={probe.linuxById} />}
       </div>
+
+      {!bitlockerOk(probe) && (
+        <article className="blocker warning">
+          <div>
+            <h3>Turn off BitLocker (recommended)</h3>
+            <p>
+              Continuing with BitLocker may trigger a recovery-key prompt if installer
+              staging or the reboot handoff fails. Windows rollback is not guaranteed.
+            </p>
+            <label className="check risk-acceptance">
+              <input
+                type="checkbox"
+                checked={bitlockerRiskAccepted}
+                onChange={(event) => onBitlockerRiskAccepted(event.target.checked)}
+              />
+              Continue with BitLocker enabled and accept the recovery risk.
+            </label>
+          </div>
+        </article>
+      )}
 
       {probe.blockingReasons.map((reason, i) => {
         const action = reasonAction(reason);
@@ -962,6 +1019,9 @@ function ConfirmStep({
   secondConfirm,
   onEraseInput,
   onSecondConfirm,
+  localIsoPath,
+  onLocalIsoPath,
+  bitlockerActive,
 }: {
   probe: MachineProbe | null;
   identity: CidataIdentity;
@@ -969,7 +1029,12 @@ function ConfirmStep({
   secondConfirm: boolean;
   onEraseInput: (v: string) => void;
   onSecondConfirm: (v: boolean) => void;
+  localIsoPath: string | null;
+  onLocalIsoPath: (path: string | null) => void;
+  bitlockerActive: boolean;
 }) {
+  const [pickingIso, setPickingIso] = useState(false);
+  const [isoError, setIsoError] = useState<string | null>(null);
   const disk =
     probe?.disks.find((d) => d.deviceId === probe.recommendedDiskId) ??
     probe?.disks.find((d) => d.isBoot);
@@ -984,6 +1049,12 @@ function ConfirmStep({
         After reboot, Omarchy will wipe this entire disk automatically. Linux
         will not ask again.
       </p>
+      {bitlockerActive && (
+        <p className="banner">
+          BitLocker remains enabled. If staging or boot handoff fails, Windows may
+          require its recovery key and rollback may not work.
+        </p>
+      )}
       <dl className="summary-grid">
         <dt>user</dt>
         <dd>
@@ -997,7 +1068,36 @@ function ConfirmStep({
         <dd>{identity.encrypt ? "on" : "off"}</dd>
         <dt>layout</dt>
         <dd>{kb}</dd>
+        <dt>iso</dt>
+        <dd className="iso-source">
+          <span className={localIsoPath ? "mono" : undefined}>
+            {localIsoPath ?? "latest official release (download)"}
+          </span>
+          <button
+            type="button"
+            className="btn ghost compact"
+            disabled={pickingIso}
+            onClick={() => {
+              if (localIsoPath) {
+                onLocalIsoPath(null);
+                setIsoError(null);
+                return;
+              }
+              setPickingIso(true);
+              setIsoError(null);
+              void invoke<string | null>("pick_local_iso")
+                .then((path) => {
+                  if (path) onLocalIsoPath(path);
+                })
+                .catch((err: unknown) => setIsoError(invokeError(err)))
+                .finally(() => setPickingIso(false));
+            }}
+          >
+            {localIsoPath ? "Use latest instead" : pickingIso ? "Selecting…" : "Use downloaded ISO"}
+          </button>
+        </dd>
       </dl>
+      {isoError && <p className="field-error iso-error">{isoError}</p>}
       {disk && <DiskCard disk={disk} linuxById={probe?.linuxById ?? null} />}
       <label className="prompt-line">
         <span className="ps">&gt;</span>
@@ -1051,6 +1151,8 @@ function MutateStep({
   native,
   identity,
   journal,
+  localIsoPath,
+  allowBitlocker,
   onStatus,
   onJournal,
   onClearPassword,
@@ -1059,6 +1161,8 @@ function MutateStep({
   native: boolean;
   identity: CidataIdentity;
   journal: StateJournal | null;
+  localIsoPath: string | null;
+  allowBitlocker: boolean;
   onStatus: (next: { phase: string; ready: boolean; rebooting: boolean }) => void;
   onJournal: (next: StateJournal | null) => void;
   onClearPassword: () => void;
@@ -1121,7 +1225,15 @@ function MutateStep({
         }
         if (start === "download") {
           setPhase("download");
-          await invoke("download_iso");
+          if (localIsoPath) {
+            const selected = await invoke<LocalIsoSelection>("prepare_local_iso", {
+              path: localIsoPath,
+            });
+            setBytes(selected.bytes);
+            setTotal(selected.bytes);
+          } else {
+            await invoke("download_iso");
+          }
           if (cancelled) return;
           setPhase("hash");
           const result = await invoke<VerifyResult>("verify_iso");
@@ -1130,7 +1242,7 @@ function MutateStep({
           setBytes(result.bytes);
           setTotal(result.bytes);
           setPhase("prepare");
-          await invoke("prepare_installer_partition");
+          await invoke("prepare_installer_partition", { allowBitlocker });
           if (cancelled) return;
         }
         if (start === "download" || start === "stage") {
@@ -1167,15 +1279,17 @@ function MutateStep({
       cancelled = true;
       unlisten?.();
     };
-    // journal is read at start via IPC; retry is `tick`
+    // journal and ISO choice are captured when this install attempt starts; retry is `tick`
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
+  }, [tick, localIsoPath, allowBitlocker]);
 
   const pct =
     total && total > 0 ? Math.min(100, Math.round((bytes / total) * 100)) : null;
   const label =
     phase === "download"
-      ? "Downloading official ISO"
+      ? localIsoPath
+        ? "Preparing selected ISO"
+        : "Downloading official ISO"
       : phase === "hash"
         ? "Checking sha256"
         : phase === "signature"
@@ -1213,7 +1327,9 @@ function MutateStep({
           return (
             <li key={item.id} className={state}>
               <span>{state === "todo" ? "··" : state}</span>
-              <span>{item.label}</span>
+              <span>
+                {item.id === "download" && localIsoPath ? "selected iso" : item.label}
+              </span>
               {item.id === "download" && working && phase === "download" && (
                 <span>
                   {formatBytes(bytes)}

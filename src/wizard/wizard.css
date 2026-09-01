@@ -514,6 +514,15 @@ ul.ticks li::before {
   color: var(--red);
 }
 
+.blocker.warning h3 {
+  color: var(--yellow);
+}
+
+.risk-acceptance {
+  margin-top: 0.75rem;
+  color: var(--warn-fg);
+}
+
 .blocker p {
   margin: 0;
   color: var(--muted);
@@ -729,6 +738,31 @@ ul.ticks li::before {
   margin: -0.25rem 0 0.15rem;
   color: var(--red);
   font-size: 0.75rem;
+}
+
+.iso-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.iso-source > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn.compact {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.55rem;
+  min-height: auto;
+  font-size: 0.75rem;
+}
+
+.iso-error {
+  margin: 0;
 }
 
 .identity-preview {

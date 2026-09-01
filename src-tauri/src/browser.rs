@@ -301,6 +301,18 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
+        "pick_local_iso" => blocking!(platform::pick_local_iso()),
+        "prepare_local_iso" => {
+            let _operation = state.operation.lock().await;
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "path is required".to_string())?;
+            download::prepare_local_iso(std::path::Path::new(path))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|value| serde_json::to_value(value).map_err(|e| e.to_string()))
+        }
         "verify_iso" => {
             let _operation = state.operation.lock().await;
             let tx = state.events.clone();
@@ -316,7 +328,11 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
         }
         "prepare_installer_partition" => {
             let _operation = state.operation.lock().await;
-            blocking!(platform::prepare_installer_partition())
+            let allow_bitlocker = args
+                .get("allowBitlocker")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            blocking!(platform::prepare_installer_partition(allow_bitlocker))
         }
         "stage_bootloader" => {
             let _operation = state.operation.lock().await;

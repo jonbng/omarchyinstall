@@ -106,6 +106,12 @@ export type VerifyResult = {
   bytes: number;
 };
 
+export type LocalIsoSelection = {
+  path: string;
+  filename: string;
+  bytes: number;
+};
+
 export type PrepareResult = {
   omarchyinstGuid: string;
   omarchyinstPartuuid: string;

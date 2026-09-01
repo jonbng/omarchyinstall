@@ -62,8 +62,38 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
     }
 }
 
-pub fn prepare_installer_partition() -> Result<PrepareResult> {
-    mutate::prepare_installer_partition()
+pub fn pick_local_iso() -> Result<Option<std::path::PathBuf>> {
+    // Use the system picker here instead of a WebView API so this also works in
+    // the secure browser fallback used on machines without WebView2.
+    let script = r#"
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+Add-Type -AssemblyName System.Windows.Forms
+$picker = New-Object System.Windows.Forms.OpenFileDialog
+$picker.Title = 'Select an already downloaded Omarchy ISO'
+$picker.Filter = 'Omarchy ISO (omarchy-*.iso)|omarchy-*.iso|ISO images (*.iso)|*.iso'
+$picker.CheckFileExists = $true
+$picker.Multiselect = $false
+if ($picker.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($picker.FileName)
+}
+"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Message(format!(
+            "ISO file picker failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let path = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Message("ISO file picker returned an invalid path".into()))?;
+    let path = path.trim();
+    Ok((!path.is_empty()).then(|| std::path::PathBuf::from(path)))
+}
+
+pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
+    mutate::prepare_installer_partition(allow_bitlocker)
 }
 
 pub fn stage_bootloader() -> Result<StageResult> {

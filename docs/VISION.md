@@ -96,7 +96,7 @@ The Windows app is a bootstrap. It does not reimplement partitioning, pacstrap, 
 - Integrity: download from `iso.omarchy.org`, sha256 required, GPG `.sig` **required** against the pinned key.
 - Reversible until reboot into a live environment that will autoinstall (`wipe: true` with no Linux confirm). Prefer `BootNext` so a failed firmware handoff still boots Windows; see UEFI handoff for the BootOrder footnote.
 - Never write `EFI/Microsoft`.
-- Detect BitLocker and **refuse** until every encryptable volume on the target disk is fully decrypted. Suspending is not enough. We block because **shrink and ESP writes on a BitLocker OS volume brick the machine with a recovery-key prompt**, not because the full-disk configurator will abort (it will not; see BitLocker).
+- Detect BitLocker on every encryptable target-disk volume and strongly recommend full decryption. If it remains enabled, require an explicit recovery-risk acknowledgement before mutation. Suspending is not the same as decrypting: shrink and ESP writes can leave Windows demanding its recovery key, and rollback is not guaranteed.
 - Detect Secure Boot and **block or instruct**. Do not invent a shim-signing program in this app.
 - **Intel RST / VMD RAID: always block in v1** (`BlockingReason::Rst`). No attempt to install onto Intel RAID metadata.
 - Detect TPM/fTPM and **mention** it; **do not refuse** solely because TPM is present. Only Secure Boot off is required to boot unsigned GRUB.
@@ -112,7 +112,7 @@ The Windows app is a bootstrap. It does not reimplement partitioning, pacstrap, 
 - **Not BIOS/CSM, not ARM Windows, not Dynamic Disks, not Storage Spaces, not Intel RST/VMD RAID, not multi-disk “install Omarchy on the other drive” in v1.** RST is a hard block, not a warning.
 - **Not silently decrypting BitLocker, not clearing TPM, not modifying BitLocker protectors.** TPM presence is informational.
 - **Not Authenticode-signing the portable EXE until first public release.** Dogfood unsigned internally. Signing is release-engineering, not a blocker for probe/wizard/lab.
-- **Not 8 GiB RAM in v1.** v1 hard-gates 16 GiB installed / ~14 GiB `ullTotalPhys`, but this may exclude too much otherwise-supported hardware and must be revisited after v1. Candidate C (userspace copy-then-unmount) improves failure handling but, by itself, does **not** lower the RAM requirement because it still copies the same ~6 GiB squashfs into tmpfs. A genuinely lower-memory path needs Candidate D, a smaller/network-backed live environment, or an ISO whose live root and offline mirror are separated.
+- **Not 8 GiB RAM in v1.** v1 hard-gates 12 GiB installed / ~10 GiB `ullTotalPhys` and warns below 14 GiB, but this must be validated and revisited after v1. Candidate C (userspace copy-then-unmount) improves failure handling but, by itself, does **not** lower the RAM requirement because it still copies the same ~6 GiB squashfs into tmpfs. A genuinely lower-memory path needs Candidate D, a smaller/network-backed live environment, or an ISO whose live root and offline mirror are separated.
 - **Not claiming “zero ISO bytes changed” until PR 7a measures it.** Initramfs `ntfs3` and `copytoram=y` releasing `img_dev` are lab gates. If either fails, we propose a patch against `references/omarchy-iso/` and do not ship mutate-capable Windows code against an ISO that cannot hand off.
 
 ---
@@ -231,8 +231,11 @@ sequenceDiagram
 
   User->>App: Run portable EXE, elevated
   App->>App: probe_machine (UEFI, SB, BitLocker, RAM, disks)
-  alt Secure Boot on / BitLocker not FullyDecrypted / RAM gate fail / not UEFI
+  alt Secure Boot on / RAM gate fail / not UEFI
     App-->>User: Block with instructions (no disk writes)
+  end
+  opt BitLocker not FullyDecrypted
+    App-->>User: Recommend decryption; require explicit recovery-risk acknowledgement
   end
   App-->>User: Wizard: identity + Windows will be erased
   User->>App: Username/password/disk confirms (typed ERASE WINDOWS)
@@ -476,7 +479,7 @@ Verified against upstream `mkinitcpio-archiso` master hooks (`hooks/archiso`, `h
 | pacstrap working set | 1–3 GiB reclaimable | bind-mount of the mirror, now from RAM |
 | **Peak, conservative** | **~8–11 GiB** | |
 
-- **Hard block: ≥ 16 GiB installed** (`GetPhysicallyInstalledSystemMemory`). Optionally also **`ullTotalPhys` ≥ ~14 GiB** so a 16 GiB SKU with a large iGPU/firmware carve-out still has enough physical RAM for an 8 GiB tmpfs after Windows is gone. Carve-out shows up as `ullTotalPhys` **below** installed size, not as low `ullAvailPhys`.
+- **Hard block: ≥ 12 GiB installed** (`GetPhysicallyInstalledSystemMemory`) and **`ullTotalPhys` ≥ ~10 GiB**, allowing up to a 2 GiB iGPU/firmware carve-out. Warn when either installed or usable RAM is below 14 GiB because the measured conservative peak is ~8–11 GiB. Carve-out shows up as `ullTotalPhys` **below** installed size, not as low `ullAvailPhys`.
 - **`ullAvailPhys` is a warning only.** `copytoram=y` runs in the initramfs **after Windows is gone**. A 16 GiB laptop with Chrome/Defender using 8 GiB at probe time is still a 16 GiB machine. UI may say “close apps if you like; it does not affect the Linux copy.” Do not `BlockingReason::Ram` on available bytes.
 - **8 GiB installed:** 6 GiB squashfs copy will OOM. **Block.**
 - Copy time: ~6 GiB from NVMe is 15–40 s; from HDD, minutes. Omit `quiet` so `pv` can show progress; Plymouth `splash` may still hide it — lab-check.
@@ -515,13 +518,13 @@ The payoff is support for 8 GiB, and potentially 4 GiB, systems without requirin
 
 ### Future follow-up — lower-memory installs
 
-v1 keeps the 16 GiB installed / ~14 GiB `ullTotalPhys` hard gate because `copytoram=y` is the smallest change that preserves the stock full-disk installer. Treat that number as a conservative implementation constraint, **not** a permanent product requirement. Before broad release, measure the real peak and consider deriving the gate from the verified `airootfs.sfs` size plus measured headroom instead of a fixed SKU threshold.
+v1 permits 12 GiB installed / ~10 GiB `ullTotalPhys`, with a warning below 14 GiB, because `copytoram=y` is the smallest change that preserves the stock full-disk installer. Treat that number as a provisional implementation constraint, **not** a permanent product requirement. Before broad release, measure the real peak and consider deriving the gate from the verified `airootfs.sfs` size plus measured headroom instead of a fixed SKU threshold.
 
 For actual 8 GiB support, investigate Candidate D as the offline path and a small network-backed live environment as the simpler online path. The online design can wipe normally and download packages afterward, but it makes working networking after the destructive step mandatory. Separating the live root from the offline package mirror in the official ISO may provide a middle ground. Do not describe Candidate C alone as removing the 6 GiB tmpfs cost.
 
 ### v1 decision
 
-Ship candidate A: **`copytoram=y`**, 16 GiB **installed** RAM gate (`ullAvailPhys` warning only), NTFS `img_dev` by PARTUUID. **PR 7a lab report is a merge gate before any shrink/ESP/BootNext PR.** If 4.0.2 cannot mount NTFS in initramfs, that is an ISO patch (`MODULES=(ntfs3)` or equivalent) **before** this app’s mutate path. If copytoram leaves `img_dev` busy, Candidate C. Do not ship Decision D as a hope.
+Ship candidate A: **`copytoram=y`**, 12 GiB **installed** / ~10 GiB usable RAM gate with a warning below 14 GiB (`ullAvailPhys` warning only), NTFS `img_dev` by PARTUUID. **PR 7a lab report is a merge gate before any shrink/ESP/BootNext PR.** If 4.0.2 cannot mount NTFS in initramfs, that is an ISO patch (`MODULES=(ntfs3)` or equivalent) **before** this app’s mutate path. If copytoram leaves `img_dev` busy, Candidate C. Do not ship Decision D as a hope.
 
 ---
 
@@ -541,7 +544,7 @@ NTFS shrink is blocked by unmovable files: `hiberfil.sys`, `pagefile.sys`, `Syst
 
 **Intel RST / VMD, Dynamic Disks, Storage Spaces:** detect and **block**.
 
-**BitLocker** must already be fully decrypted before shrink. Re-probe immediately before this step.
+**BitLocker:** full decryption before shrink is strongly recommended. Re-probe immediately before this step; if it remains enabled, require the explicit recovery-risk acknowledgement passed to the mutation command.
 
 On abort (PR 8): delete `OMARCHYINST` **and `cidata`**, extend C:, restore Fast Startup and hibernation to the journaled previous values. Leaving hibernation off on a Windows install the user kept is a behavior change; rollback must undo it. The cidata delete is **security-relevant** (possible plaintext LUKS passphrase).
 
@@ -768,11 +771,11 @@ Rules:
 
 The configurator’s `detect_bitlocker` (`-FVE-FS-` at offset 3) is called **only** from `run_partition_decide` — the **free-space** path. Full-disk `wipe: true` never runs that check; it destroys the volume. “The configurator will abort anyway” is **false** for this product.
 
-The Windows-side refuse-unless-fully-decrypted policy is still **correct**, because **shrink and ESP writes on a BitLocker OS volume** are how users get recovery-key bricks (dual-boot docs; `consumer-secure-boot.md` issue #105: suspend proved insufficient).
+The Windows app strongly recommends full decryption because **shrink and ESP writes on a BitLocker OS volume** can trigger recovery-key prompts (dual-boot docs; `consumer-secure-boot.md` issue #105: suspend proved insufficient). Because this product ultimately wipes Windows, an informed user may continue after an explicit acknowledgement that failed staging or handoff can make Windows rollback unavailable.
 
 WMI `root\cimv2\Security\MicrosoftVolumeEncryption` → `Win32_EncryptableVolume` on **every** encryptable volume on the target disk (Device Encryption is not only C:).
 
-Block unless **both**:
+Treat the volume as fully decrypted only when **both** are true:
 
 - `ProtectionStatus = 0`
 - `ConversionStatus = 0` (`FullyDecrypted`)
@@ -826,9 +829,9 @@ Rollback implementation lives in this app and reads `state.json`. It is a first-
 - Windows 10 or 11
 - Single-disk laptops and desktops
 - Intel and AMD
-- ≥ 16 GiB installed RAM (optional hard extra: `ullTotalPhys` ≥ ~14 GiB for iGPU carve-out). `ullAvailPhys` is **not** a gate.
+- ≥ 12 GiB installed RAM and `ullTotalPhys` ≥ ~10 GiB; warn below 14 GiB. `ullAvailPhys` is **not** a gate.
 - Enough NTFS shrink headroom for the size formula, after hibernation/Fast Startup off, **without** a pagefile reboot
-- BitLocker off (fully decrypted, ConversionStatus 0)
+- BitLocker off (fully decrypted, ConversionStatus 0) is recommended; enabled BitLocker requires explicit risk acceptance
 - Secure Boot off (TPM may remain present; we mention it, we do not block on it)
 - Not Intel RST / VMD
 
@@ -841,8 +844,8 @@ Rollback implementation lives in this app and reads `state.json`. It is a first-
 | Storage Spaces | Block |
 | Dual-disk (“wipe the other SSD”) | Out of scope |
 | ARM64 Windows | Out of scope (ISO is `arch="x86_64"`) |
-| < 16 GiB RAM | Block in **v1** (`copytoram=y`). Future: measure a size-derived floor and investigate Candidate D (offline) or a small network-backed live environment (online). Candidate C alone does not reduce RAM use. |
-| BitLocker on, decrypting, or suspended | Block |
+| < 12 GiB installed or < 10 GiB usable RAM | Block in **v1** (`copytoram=y`); warn below 14 GiB. Future: measure a size-derived floor and investigate Candidate D (offline) or a small network-backed live environment (online). Candidate C alone does not reduce RAM use. |
+| BitLocker on, decrypting, or suspended | Warn strongly; require explicit recovery/rollback-risk acknowledgement |
 | Secure Boot on | Block + firmware reboot offer |
 | Dual-boot as the product outcome | Out of scope |
 | Pagefile-disable reboot-and-resume | Out of v1; fail with unmovable-files |
@@ -968,7 +971,7 @@ pub struct MachineProbe {
     pub ram_installed_bytes: u64,   // GetPhysicallyInstalledSystemMemory
     pub ram_total_phys_bytes: u64,  // GlobalMemoryStatusEx.ullTotalPhys (installed minus firmware/iGPU carve-out)
     pub ram_avail_bytes: u64,       // ullAvailPhys — UI warning only; copytoram runs after Windows is gone
-    pub ram_ok_for_copytoram: bool, // installed >= 16 GiB && total_phys >= 14 GiB; NOT avail
+    pub ram_ok_for_copytoram: bool, // installed >= 12 GiB && total_phys >= 10 GiB; NOT avail
     pub tpm_present: bool,          // informational; not a blocking reason
     pub recommended_disk_id: Option<String>, // Windows boot disk
     pub target_esp: Option<TargetEsp>, // ESP proven to be on that same disk
@@ -1170,18 +1173,18 @@ On non-Windows `tauri dev`, steps 1–4 render with stub probe data; mutate comm
 | **A** | Final state is native Omarchy. Windows is replaced, not dual-booted, not in a file. | Product identity. Wubi is the thing we are not. |
 | **B** | Windows app is bootstrap only. Official ISO configurator + orchestrator do the real install. | The ISO is the supported installer. |
 | **C** | Happy path has no USB. | The entire reason this repo exists. |
-| **D** | Same-disk strategy is **`copytoram=y` of `airootfs.sfs`**, v1 RAM hard gate **16 GiB installed** (optional `ullTotalPhys` ≥ ~14 GiB). `ullAvailPhys` is a warning, not a block. Lab 7a **before** shrink. Fallback if copy leaves `img_dev` busy: Candidate C. If NTFS is missing in initramfs: ISO `MODULES=` patch, not C. | Stock full-disk `wipe: true`. Auto copytoram never fires on a ~6 GiB squashfs. Copy runs after Windows is gone. |
+| **D** | Same-disk strategy is **`copytoram=y` of `airootfs.sfs`**, v1 RAM hard gate **12 GiB installed** / ~10 GiB usable, with a warning below 14 GiB. `ullAvailPhys` is a warning, not a block. Lab 7a **before** shrink. Fallback if copy leaves `img_dev` busy: Candidate C. If NTFS is missing in initramfs: ISO `MODULES=` patch, not C. | Stock full-disk `wipe: true`. Auto copytoram never fires on a ~6 GiB squashfs. Copy runs after Windows is gone. |
 | **E** | Payload is the **ISO file on NTFS `OMARCHYINST`** (size formula) + **official `BOOTX64.EFI`** at `EFI/OmarchyInstall/` + **discovered search bait** (typically `/boot/<iso_uuid>.uuid`; **not** hardcoded `/.disk/`) + **our** `boot/grub/grub.cfg`. Not FAT32. Not a sibling grub.cfg the official binary ignores. | 4 GiB FAT32 cap; official GRUB embed searches the baked `ARCHISO_SEARCH_FILENAME` and loads `/boot/grub/grub.cfg` on that volume. mkarchiso **abandoned `/.disk/`** so a leading-dot dir is not missed when copying ISO contents. |
 | **F** | Loopback of the ISO is bootstrap-only. Loop of the installed OS is forbidden. | Wubi line. |
 | **G** | Prefer `BootNext`; never prepend `BootOrder`; never write `EFI/Microsoft` or `EFI/Boot/bootx64.efi`. Append-not-prepend is the OEM escape hatch if BootNext is ignored. | Failed attempt must still boot Windows. Cite `consumer-secure-boot.md` / `detect_windows_esp`. |
 | **H** | v1 **writes cidata** from the Windows wizard. Linux skips the configurator and autoinstalls full-disk (`wipe: true`). | Product call. Satisfy `omarchy-cidata-load` with a **second ~64 MiB FAT32 volume labeled `cidata`** (no ISO patch). Windows-side confirms are the only human gate. `defer-provisioning` is not v1 default. Secrets (LUKS passphrase in JSON) live on that volume until wipe; hidden + no-default-drive-letter, acknowledging that FAT32 has no ACL boundary. Disk path is Linux `/dev/disk/by-id/…`, not `PhysicalDriveN`. |
-| **I** | BitLocker: refuse unless `ProtectionStatus=0` **and** `ConversionStatus=0` on every encryptable volume on the disk. Re-probe before mutate. Rationale is shrink/ESP safety, not the free-space configurator abort. | Full-disk path never calls `detect_bitlocker`. |
+| **I** | BitLocker: recommend full decryption; if any target-disk volume is not fully decrypted, require explicit recovery-risk acceptance in both UI and mutation command. Re-probe before mutate. | Full-disk eventually wipes Windows, but shrink/ESP changes can trigger recovery and invalidate rollback first. |
 | **J** | Secure Boot: detect and block; offer firmware reboot. No shim in this app. Detect TPM and mention it; **do not block on TPM alone**. | ISO is unsigned GRUB today. Only SB off is required. |
 | **J2** | Intel RST / VMD: **always block** in v1. | RAID metadata is out of scope. |
 | **K** | ISO is downloaded at runtime **onto `OMARCHYINST`**, not bundled, not double-copied under LocalAppData. sha256 and **GPG are blocking**. URL pinned in Rust. | Supply chain. Peak free space is the hole we just created. |
 | **L** | Dual-boot is out of v1. Cidata JSON is full-disk `"wipe": true` only. | Product is replacement. Configurator is skipped. |
 | **L2** | Authenticode of the portable EXE is deferred until first public release. | Dogfood unsigned internally. Not a probe/wizard/lab blocker. |
-| **L3** | v1 RAM floor is 16 GiB installed, but it is provisional. Future lower-memory work investigates a measured size-derived gate, Candidate D for offline installs, or a small online live environment. Candidate C alone retains the same RAM cost. | Avoid making a conservative implementation constraint a permanent hardware requirement. |
+| **L3** | v1 RAM floor is 12 GiB installed / ~10 GiB usable, with a warning below 14 GiB, but it is provisional. Future lower-memory work investigates a measured size-derived gate, Candidate D for offline installs, or a small online live environment. Candidate C alone retains the same RAM cost. | Avoid making a conservative implementation constraint a permanent hardware requirement. |
 | **M** | Dev-on-Linux, production-on-Windows. Download/verify run on stub hosts; mutate does not. | Already the repo’s layout. |
 | **N** | Last safe rollback is **before reboot into cidata autoinstall**. After the orchestrator starts `wipe: true`, we are honest, not heroic. | Linux no longer shows `confirm_disk_overwrite`. |
 | **O** | v1 does not reboot-and-resume for pagefile. Fail on unmovable files. Restore Fast Startup/hibernation on abort. | Half-applied power settings across a Windows reboot is a second product. |
@@ -1304,15 +1307,15 @@ Support bundle (`export_support_bundle`): zip of logs + redacted `state.json` + 
 | `ntfs3` absent from `initramfs-linux-t2.img` | **Critical** | Same lab (`lsinitcpio`, emergency shell). ISO `MODULES=` patch. Do not claim zero ISO bytes changed until measured. |
 | Official GRUB embed ignores our config (wrong bait path / Joliet name mismatch) | **Critical** | Discover baked `*.uuid` path (typically `/boot/<iso_uuid>.uuid`, not `.disk`); plant that exact relative path; config at `/boot/grub/grub.cfg`; lab “our menuentry ran.” Option 2 custom GRUB only if that fails. |
 | `copytoram=auto` silently does nothing | High | We emit `copytoram=y`, never bare `copytoram` or auto. |
-| 6 GiB squashfs OOMs on “16 GB” machines with iGPU carve-out | High | Hard-block on installed ≥ 16 GiB and `ullTotalPhys` ≥ ~14 GiB. Do **not** gate on `ullAvailPhys`. `copytoram_size=8G` not 75%. |
+| 6 GiB squashfs OOMs on low-memory machines | High | Hard-block below 12 GiB installed or ~10 GiB `ullTotalPhys`, and warn below 14 GiB. Do **not** gate on `ullAvailPhys`. `copytoram_size=8G` not 75%. |
 | NTFS shrink returns << formula size (unmovable files) | High | Hibernate off, Fast Startup off, then **fail closed**. No silent defrag, no pagefile reboot in v1. |
 | WinRE / vendor recovery confuse the disk map | Medium | Record GUIDs, never assume p-numbers. Create `OMARCHYINST` in the shrink hole. |
 | Firmware ignores `BootNext` unless entry is in `BootOrder` | High | Append-not-prepend hatch; Undo UX; later USB fallback. Do not promise never-touch-BootOrder as universal compatibility. |
 | EFI variable API denied | High | Probe `efi_vars_writable` before shrink. |
 | GRUB-from-ISO cannot read NTFS | Medium | Lab. exFAT has the same initramfs question. |
 | Initramfs cannot read NTFS even if GRUB can | **Critical** | Issue 3. Hard ISO dependency. |
-| User enables BitLocker between probe and shrink | Medium | Re-probe immediately before mutate. |
-| User thinks “suspend BitLocker” is enough | High | Block on ConversionStatus 0, not ProtectionStatus alone. |
+| User enables BitLocker between probe and shrink | Medium | Re-probe immediately before mutate and require the acknowledgement flag. |
+| User thinks “suspend BitLocker” is the same as decrypted | High | Show it as still enabled using ConversionStatus/FVE state and require recovery-risk acceptance. |
 | Secure Boot on, GRUB rejected | High | Block before reboot with firmware instructions. |
 | Staging succeeds, Windows Update rewrites ESP | Medium | `state.json`; BootNext is one-shot. |
 | Mid-wipe power loss | High (data) | UX honesty. USB recovery. |
@@ -1326,7 +1329,7 @@ Support bundle (`export_support_bundle`): zip of logs + redacted `state.json` + 
 
 1. ~~cidata vs interactive configurator.~~ **Closed:** cidata autoinstall from the Windows wizard (Decision H). Second FAT volume labeled `cidata`; no ISO patch.
 2. **If GRUB-on-NTFS or initramfs-on-NTFS is a field disaster, do we:** (a) exFAT (same module question), (b) split the ISO in an official rebuild so the squashfs is < 4 GiB and the mirror is loose files, (c) require USB after all?
-3. ~~RAM gate for v1.~~ **Closed for v1 only:** hard-gate 16 GiB installed / ~14 GiB `ullTotalPhys`; `ullAvailPhys` is not a gate. **Open for later releases:** validate a size-derived floor and choose between Candidate D (offline), a network-backed installer, or an ISO split between the live root and offline mirror. Candidate C alone cannot support 8 GiB because it retains the ~6 GiB tmpfs copy.
+3. ~~RAM gate for v1.~~ **Closed for v1 only:** hard-gate 12 GiB installed / ~10 GiB `ullTotalPhys`, warn below 14 GiB; `ullAvailPhys` is not a gate. **Open for later releases:** validate a size-derived floor and choose between Candidate D (offline), a network-backed installer, or an ISO split between the live root and offline mirror. Candidate C alone cannot support 8 GiB because it retains the ~6 GiB tmpfs copy.
 4. ~~HOOKS order / whether to patch `loopback.cfg`.~~ **Closed:** HOOKS order is not the risk; we write our own `boot/grub/grub.cfg` with `copytoram=y`. Remaining lab is NTFS + unmount.
 5. **How do we discover “latest ISO”?** Pin 4.0.2 until `iso.omarchy.org` publishes a signed `latest.json`. Do not scrape HTML.
 6. ~~GPG blocking vs warn-only.~~ **Closed:** blocking, pinned key, rotation = app release.

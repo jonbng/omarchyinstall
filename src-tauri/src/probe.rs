@@ -2,10 +2,10 @@
 
 use crate::platform::{BlockingReason, MachineProbe};
 
-/// 16 GiB. `copytoram=y` of a ~6 GiB squashfs.
-pub const RAM_INSTALLED_MIN: u64 = 16 * GIB;
-/// ~14 GiB `ullTotalPhys` so iGPU/firmware carve-out on a 16 GiB SKU still passes.
-pub const RAM_TOTAL_PHYS_MIN: u64 = 14 * GIB;
+/// 12 GiB installed. Machines below the 14 GiB recommendation get a UI warning.
+pub const RAM_INSTALLED_MIN: u64 = 12 * GIB;
+/// Allow up to a 2 GiB firmware/iGPU carve-out on a 12 GiB machine.
+pub const RAM_TOTAL_PHYS_MIN: u64 = 10 * GIB;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const MIB: u64 = 1024 * 1024;
@@ -60,13 +60,6 @@ pub fn blocking_reasons(probe: &MachineProbe, check_elevation: bool) -> Vec<Bloc
             need_installed: RAM_INSTALLED_MIN,
             need_total_phys: RAM_TOTAL_PHYS_MIN,
         });
-    }
-    for vol in &probe.bitlocker {
-        if !vol.fully_decrypted {
-            out.push(BlockingReason::BitLocker {
-                mount: vol.mount.clone(),
-            });
-        }
     }
     for disk in &probe.disks {
         if disk.partition_style != "gpt" && disk.is_boot {
@@ -195,11 +188,11 @@ mod tests {
 
     #[test]
     fn ram_gate_table() {
-        assert!(!ram_ok_for_copytoram(16 * GIB - 1, 16 * GIB));
-        assert!(!ram_ok_for_copytoram(16 * GIB, 14 * GIB - 1));
-        assert!(ram_ok_for_copytoram(16 * GIB, 14 * GIB));
+        assert!(!ram_ok_for_copytoram(12 * GIB - 1, 12 * GIB));
+        assert!(!ram_ok_for_copytoram(12 * GIB, 10 * GIB - 1));
+        assert!(ram_ok_for_copytoram(12 * GIB, 10 * GIB));
+        assert!(ram_ok_for_copytoram(12 * GIB, 12 * GIB));
         assert!(ram_ok_for_copytoram(32 * GIB, 30 * GIB));
-        assert!(!ram_ok_for_copytoram(16 * GIB, 13 * GIB));
     }
 
     #[test]
@@ -236,6 +229,17 @@ mod tests {
         assert!(!bitlocker_fully_decrypted(0, 0, true));
         assert!(bitlocker_fully_decrypted(0, 0, false));
         assert!(!bitlocker_fully_decrypted(0, 1, false));
+    }
+
+    #[test]
+    fn active_bitlocker_is_a_warning_not_a_blocker() {
+        let mut p = probe();
+        p.bitlocker[0].protection_status = 1;
+        p.bitlocker[0].conversion_status = 1;
+        p.bitlocker[0].fully_decrypted = false;
+        let p = attach_reasons(p, true);
+        assert!(p.blocking_reasons.is_empty(), "{:?}", p.blocking_reasons);
+        assert!(p.bitlocker.iter().any(|volume| !volume.fully_decrypted));
     }
 
     #[test]

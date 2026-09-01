@@ -44,6 +44,8 @@ pub fn run() {
             commands::reboot_to_firmware,
             commands::load_install_state,
             commands::download_iso,
+            commands::pick_local_iso,
+            commands::prepare_local_iso,
             commands::verify_iso,
             commands::prepare_installer_partition,
             commands::stage_bootloader,

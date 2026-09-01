@@ -58,6 +58,10 @@ pub fn reboot_to_firmware() -> Result<()> {
     Err(crate::error::Error::WindowsOnly)
 }
 
+pub fn pick_local_iso() -> Result<Option<PathBuf>> {
+    Ok(std::env::var_os("OMARCHY_LOCAL_ISO").map(PathBuf::from))
+}
+
 fn journal_path() -> Result<PathBuf> {
     Ok(paths::install_data_dir()?.join("state.json"))
 }
@@ -90,7 +94,7 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
     load_journal()
 }
 
-pub fn prepare_installer_partition() -> Result<PrepareResult> {
+pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
     dry_run_pause();
     if let Some(journal) = load_journal()? {
         if let (Some(om), Some(partuuid), Some(ci), Some(old_c)) = (
@@ -115,6 +119,12 @@ pub fn prepare_installer_partition() -> Result<PrepareResult> {
         }
     }
     let probe = probe_machine()?;
+    if probe.bitlocker.iter().any(|volume| !volume.fully_decrypted) && !allow_bitlocker {
+        return Err(Error::Message(
+            "BitLocker is still enabled. Turn it off (recommended), or explicitly accept the BitLocker recovery risk before continuing."
+                .into(),
+        ));
+    }
     if !probe.blocking_reasons.is_empty() {
         return Err(Error::Message(
             "machine probe has blocking reasons; refuse to shrink".into(),
@@ -528,7 +538,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("XDG_DATA_HOME", &home);
 
-        let prepared = prepare_installer_partition().expect("prepare");
+        let prepared = prepare_installer_partition(false).expect("prepare");
         assert_eq!(prepared.omarchyinst_partuuid, STUB_OMARCHYINST_PARTUUID);
         assert!(prepared.partition_bytes >= 8 * GIB);
 
@@ -580,7 +590,7 @@ mod tests {
         let bundle = export_support_bundle().expect("bundle");
         assert!(bundle.exists());
 
-        let prepared_again = prepare_installer_partition().expect("prepare idempotent");
+        let prepared_again = prepare_installer_partition(false).expect("prepare idempotent");
         assert_eq!(prepared_again.omarchyinst_guid, prepared.omarchyinst_guid);
         let boot_again = set_boot_next().expect("bootnext idempotent");
         assert_eq!(boot_again.boot_id, STUB_BOOT_ID);
