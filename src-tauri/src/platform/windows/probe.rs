@@ -34,6 +34,7 @@ use windows::{
 
 const OMARCHY_VENDOR: PCWSTR = w!("{FDCA2A4E-3D8D-4EB7-AE97-80598A4D5DB4}");
 const OMARCHY_WRITE_PROBE: PCWSTR = w!("OmarchyInstallWriteProbe");
+const EFI_VARIABLE_ATTRIBUTES: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 const LDM_META: &str = "5808c8aa-7e8f-42e0-85d2-e1e90434cfb3";
 const LDM_DATA: &str = "af9b60a0-1431-4f62-bc68-3311714a69ad";
 
@@ -175,10 +176,11 @@ fn efi_variables_writable() -> bool {
             OMARCHY_VENDOR,
             Some(nonce.as_ptr().cast()),
             nonce.len() as u32,
-            0x0000_0001 | 0x0000_0002 | 0x0000_0004,
+            EFI_VARIABLE_ATTRIBUTES,
         )
     };
-    if write.is_err() {
+    if let Err(error) = write {
+        log::warn!("EFI variable write probe failed: {error}");
         return false;
     }
     let mut readback = [0u8; 4];
@@ -191,10 +193,24 @@ fn efi_variables_writable() -> bool {
         )
     };
     let deleted = unsafe {
-        SetFirmwareEnvironmentVariableExW(OMARCHY_WRITE_PROBE, OMARCHY_VENDOR, None, 0, 0)
+        SetFirmwareEnvironmentVariableExW(
+            OMARCHY_WRITE_PROBE,
+            OMARCHY_VENDOR,
+            None,
+            0,
+            EFI_VARIABLE_ATTRIBUTES,
+        )
     }
+    .inspect_err(|error| log::warn!("EFI variable cleanup probe failed: {error}"))
     .is_ok();
-    read == nonce.len() as u32 && readback == nonce && deleted
+    let readable = read == nonce.len() as u32 && readback == nonce;
+    if !readable {
+        log::warn!(
+            "EFI variable read probe failed: bytes_read={read}, expected={}",
+            nonce.len()
+        );
+    }
+    readable && deleted
 }
 
 fn enable_system_environment_privilege() -> Result<()> {
