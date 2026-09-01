@@ -1,0 +1,97 @@
+# Build the portable Windows executable and publish it when a version tag is pushed.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Windows x64 release
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches project version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(.+)$') {
+            throw "Release tag must start with v"
+          }
+
+          $version = $Matches[1]
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoMatch = Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $cargoMatch) {
+            throw "Could not read the package version from src-tauri/Cargo.toml"
+          }
+          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+
+          $declared = @($packageVersion, $tauriVersion, $cargoVersion)
+          if ($declared | Where-Object { $_ -ne $version }) {
+            throw "Tag $tag does not match package.json ($packageVersion), tauri.conf.json ($tauriVersion), and Cargo.toml ($cargoVersion)"
+          }
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Rust tests
+        run: bun run check:rust
+
+      - name: Build portable executable
+        run: bun run tauri:build
+
+      - name: Verify portable dependencies
+        shell: pwsh
+        run: |
+          $imports = dumpbin /DEPENDENTS src-tauri/target/release/OmarchyInstaller.exe | Out-String
+          if ($imports -match '(?i)VCRUNTIME|MSVCP|WebView2Loader\.dll') {
+            throw "Portable executable has an unexpected runtime dependency:`n$imports"
+          }
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          $asset = "OmarchyInstaller-windows-x64.exe"
+          Copy-Item src-tauri/target/release/OmarchyInstaller.exe $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content "$asset.sha256" -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "OmarchyInstaller-windows-x64.exe#Windows x64 portable executable" `
+            "OmarchyInstaller-windows-x64.exe.sha256#SHA-256 checksum" `
+            --verify-tag `
+            --generate-notes `
+            --title "Omarchy Install $env:GITHUB_REF_NAME"

@@ -15,8 +15,8 @@ use windows::{
             SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
         },
         Storage::FileSystem::{
-            CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            CreateFileW, ReadFile, SetFilePointerEx, FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         },
         System::{
             Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},
@@ -291,7 +291,6 @@ struct PsDisk {
     serial_number: Option<String>,
     model: Option<String>,
     friendly_name: Option<String>,
-    path: Option<String>,
     guid: Option<String>,
 }
 
@@ -340,7 +339,6 @@ $disks = @(Get-Disk | ForEach-Object {
     serialNumber = [string]$_.SerialNumber
     model = [string]$_.Model
     friendlyName = [string]$_.FriendlyName
-    path = [string]$_.Path
     guid = [string]$_.Guid
   }
 })
@@ -477,10 +475,7 @@ fn disks_from_inventory(inv: &Inventory) -> Vec<DiskMap> {
             })
             .max();
         out.push(DiskMap {
-            device_id: disk
-                .path
-                .clone()
-                .unwrap_or_else(|| format!(r"\\.\PHYSICALDRIVE{number}")),
+            device_id: format!(r"\\.\PHYSICALDRIVE{number}"),
             size_bytes: disk.size.unwrap_or(0),
             partition_style: style,
             bus: Some(bus),
@@ -568,12 +563,23 @@ fn bitlocker_from_inventory(inv: &Inventory) -> Vec<BitlockerVolume> {
 }
 
 fn overlay_fve_signatures(bitlocker: &mut Vec<BitlockerVolume>, disks: &[DiskMap]) {
-    let _ = disks;
     for vol in bitlocker {
-        let Some(mount) = vol.mount.as_deref().or(vol.device_id.as_deref()) else {
+        let (Some(disk_id), Some(mount)) = (vol.disk_id.as_deref(), vol.mount.as_deref()) else {
             continue;
         };
-        let fve = read_fve(mount).unwrap_or(false);
+        let Some(offset) = disks
+            .iter()
+            .find(|disk| disk.device_id.eq_ignore_ascii_case(disk_id))
+            .and_then(|disk| {
+                disk.partitions
+                    .iter()
+                    .find(|part| part.letter.as_deref() == Some(mount))
+            })
+            .map(|part| part.offset_bytes)
+        else {
+            continue;
+        };
+        let fve = read_fve(disk_id, offset).unwrap_or(false);
         vol.fully_decrypted =
             probe::bitlocker_fully_decrypted(vol.protection_status, vol.conversion_status, fve);
         if fve && vol.conversion_status == 0 {
@@ -599,10 +605,7 @@ fn target_esp_from_inventory(inv: &Inventory) -> (Option<TargetEsp>, Vec<Blockin
         );
     };
     let number = disk.number.unwrap_or(u32::MAX);
-    let disk_id = disk
-        .path
-        .clone()
-        .unwrap_or_else(|| format!(r"\\.\PHYSICALDRIVE{number}"));
+    let disk_id = format!(r"\\.\PHYSICALDRIVE{number}");
     let candidates: Vec<&PsPart> = inv
         .partitions
         .as_deref()
@@ -665,12 +668,8 @@ fn normalize_guid(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn read_fve(mount: &str) -> Option<bool> {
-    let path = if mount.starts_with(r"\\") {
-        mount.trim_end_matches('\\').to_string()
-    } else {
-        format!(r"\\.\{}", mount.trim_end_matches('\\'))
-    };
+fn read_fve(disk: &str, offset: u64) -> Option<bool> {
+    let path = disk.trim_end_matches('\\');
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let handle = CreateFileW(
@@ -683,7 +682,14 @@ fn read_fve(mount: &str) -> Option<bool> {
             None,
         )
         .ok()?;
-        let mut buf = [0u8; 16];
+        let seek = SetFilePointerEx(handle, i64::try_from(offset).ok()?, None, Default::default());
+        if seek.is_err() {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        // Raw disk reads must be sector-sized even though the signature is in
+        // bytes 3..11. A short read fails with ERROR_INVALID_PARAMETER.
+        let mut buf = [0u8; 512];
         let mut read = 0u32;
         let ok = ReadFile(handle, Some(buf.as_mut_slice()), Some(&mut read), None).is_ok();
         let _ = CloseHandle(handle);

@@ -12,14 +12,37 @@ export function invokeError(err: unknown): string {
 export const USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
 export const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 export const MIN_PASSWORD = 6;
+const RESERVED_USERNAMES = new Set([
+  "root", "bin", "daemon", "mail", "ftp", "http", "nobody", "dbus", "git",
+  "systemd-coredump", "systemd-network", "systemd-oom", "systemd-journal-remote",
+  "systemd-resolve", "systemd-timesync", "tss", "uuidd", "alpm", "avahi", "cups",
+  "cups-browsed", "lp", "_talkd", "polkitd", "rtkit", "qemu", "brltty", "gluster",
+  "rpc", "libvirt-qemu", "pcscd", "nvidia-persistenced", "sddm",
+]);
 
 export function usernameError(value: string): string | null {
   const v = value.trim();
   if (!v) return "username is required";
-  if (v === "root") return "username cannot be root";
+  if (RESERVED_USERNAMES.has(v)) return "username is reserved by the system";
   if (!USERNAME_RE.test(v)) {
     return "lowercase letters, digits, _ or -; must start with a letter or _";
   }
+  return null;
+}
+
+export function fullNameError(value: string | null): string | null {
+  const v = value?.trim() ?? "";
+  if (!v) return "Git author name is required";
+  if (v.length > 100) return "Git author name must be 100 characters or fewer";
+  if (/\p{Cc}/u.test(v)) return "Git author name contains unsupported characters";
+  return null;
+}
+
+export function emailError(value: string | null): string | null {
+  const v = value?.trim() ?? "";
+  if (!v) return null;
+  if (v.length > 254) return "email address is too long";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return "enter a valid email address";
   return null;
 }
 

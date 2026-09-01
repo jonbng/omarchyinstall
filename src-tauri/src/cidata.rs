@@ -60,14 +60,98 @@ pub fn assert_linux_by_id(device: &str) -> Result<()> {
 }
 
 pub const MIN_PASSWORD: usize = 6;
+const RESERVED_USERNAMES: &[&str] = &[
+    "root",
+    "bin",
+    "daemon",
+    "mail",
+    "ftp",
+    "http",
+    "nobody",
+    "dbus",
+    "git",
+    "alpm",
+    "avahi",
+    "brltty",
+    "cups",
+    "cups-browsed",
+    "gluster",
+    "libvirt-qemu",
+    "lp",
+    "nvidia-persistenced",
+    "pcscd",
+    "polkitd",
+    "qemu",
+    "rpc",
+    "rtkit",
+    "sddm",
+    "_talkd",
+    "systemd-coredump",
+    "systemd-journal-remote",
+    "systemd-network",
+    "systemd-oom",
+    "systemd-resolve",
+    "systemd-timesync",
+    "tss",
+    "uuidd",
+];
+const KEYBOARD_LAYOUTS: &[&str] = &[
+    "us",
+    "uk",
+    "dvorak",
+    "colemak",
+    "azerty",
+    "by",
+    "be-latin1",
+    "bg-cp1251",
+    "croat",
+    "cz",
+    "dk-latin1",
+    "nl",
+    "et",
+    "fi",
+    "fr",
+    "cf",
+    "fr_CH",
+    "ge",
+    "de",
+    "de_CH-latin1",
+    "gr",
+    "il",
+    "hu",
+    "is-latin1",
+    "ie",
+    "it",
+    "jp106",
+    "kazakh",
+    "kyrgyz",
+    "la-latin1",
+    "lv",
+    "lt",
+    "mk-utf",
+    "no-latin1",
+    "pl",
+    "pt-latin1",
+    "br-abnt2",
+    "ro",
+    "ru",
+    "sr-latin",
+    "sk-qwertz",
+    "slovene",
+    "es",
+    "sv-latin1",
+    "tj_alt-UTF8",
+    "trq",
+    "ua",
+];
 
 pub fn assert_username(username: &str) -> Result<()> {
     let username = username.trim();
     if username.is_empty() {
         return Err(Error::Message("username is required".into()));
     }
-    if username == "root" {
-        return Err(Error::Message("username cannot be root".into()));
+    if RESERVED_USERNAMES.contains(&username) {
+        return Err(Error::Message("username is reserved by the system".into()));
     }
     let b = username.as_bytes();
     if b.len() > 32 {
@@ -123,6 +207,49 @@ pub fn assert_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn assert_keyboard(keyboard: &str) -> Result<()> {
+    if !KEYBOARD_LAYOUTS.contains(&keyboard) {
+        return Err(Error::Message("unsupported keyboard layout".into()));
+    }
+    Ok(())
+}
+
+pub fn assert_timezone(timezone: &str) -> Result<()> {
+    let valid_chars = timezone
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'_' | b'-' | b'+'));
+    if timezone.is_empty()
+        || timezone.len() > 64
+        || !valid_chars
+        || timezone.starts_with('/')
+        || timezone.ends_with('/')
+        || timezone.contains("//")
+    {
+        return Err(Error::Message("invalid timezone".into()));
+    }
+    Ok(())
+}
+
+pub fn assert_git_identity(full_name: &Option<String>, email: &Option<String>) -> Result<()> {
+    if let Some(name) = full_name {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(Error::Message("invalid Git author name".into()));
+        }
+    }
+    if let Some(email) = email {
+        let valid = email.len() <= 254
+            && !email.chars().any(char::is_whitespace)
+            && email.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+            });
+        if !valid {
+            return Err(Error::Message("invalid Git author email".into()));
+        }
+    }
+    Ok(())
+}
+
 pub fn build_cidata_files(
     identity: &CidataIdentity,
     linux_by_id: &str,
@@ -132,6 +259,9 @@ pub fn build_cidata_files(
     assert_username(&identity.username)?;
     assert_hostname(&identity.hostname)?;
     assert_password(&identity.password)?;
+    assert_keyboard(&identity.keyboard)?;
+    assert_timezone(&identity.timezone)?;
+    assert_git_identity(&identity.full_name, &identity.email)?;
     let mut password = identity.password.clone();
     let hash = match sha512_crypt(&password) {
         Ok(hash) => hash,
@@ -356,6 +486,18 @@ mod tests {
         assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
         bad = ident();
         bad.password = "12345".into();
+        assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
+        bad = ident();
+        bad.keyboard = "not-a-keymap".into();
+        assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
+        bad = ident();
+        bad.timezone = "../../etc/passwd".into();
+        assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
+        bad = ident();
+        bad.full_name = Some("Bad\nName".into());
+        assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
+        bad = ident();
+        bad.email = Some("not-an-email".into());
         assert!(build_cidata_files(&bad, "/dev/disk/by-id/nvme-x", 512 * GIB).is_err());
     }
 }

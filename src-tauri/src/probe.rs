@@ -103,8 +103,8 @@ pub fn attach_reasons(mut probe: MachineProbe, check_elevation: bool) -> Machine
     probe
 }
 
-/// True when a BitLocker WMI/PS volume is fully decrypted *and* the NTFS
-/// boot sector is not still `-FVE-FS-` (suspend leaves the signature).
+/// True when a BitLocker WMI/PS volume is fully decrypted *and* the on-disk
+/// partition boot sector is not still `-FVE-FS-` (suspend leaves the signature).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn bitlocker_fully_decrypted(
     protection_status: u32,

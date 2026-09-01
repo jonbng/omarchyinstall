@@ -252,7 +252,7 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
             partition::CIDATA_BYTES,
             "FAT32",
             "cidata",
-            true,
+            false,
         )?;
         journal.cidata_guid = Some(windows_volume_path(json_str(&v, "volume")?)?);
         journal.cidata_partuuid = Some(gpt_partuuid(json_str(&v, "partuuid")?)?);
@@ -503,7 +503,7 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
         &guid,
         "cidata",
         "FAT32",
-        true,
+        false,
     )?;
     let linux = journal
         .linux_device
@@ -581,7 +581,7 @@ try {{
     $all=(& bcdedit /enum firmware /v | Out-String)
     foreach ($block in ($all -split '(?:\r?\n){{2,}}')) {{ if ($block -match [regex]::Escape('{description}')) {{ $m=[regex]::Match($block,'\{{[0-9a-fA-F-]+\}}'); if ($m.Success) {{ $id=$m.Value; break }} }} }}
   }}
-  if (-not $id) {{ $created=(& bcdedit /create /d '{description}' /application firmware | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit create failed: $created" }}; $m=[regex]::Match($created,'\{{[0-9a-fA-F-]+\}}'); if (-not $m.Success) {{ throw 'bcdedit did not return a firmware identifier' }}; $id=$m.Value }}
+  if (-not $id) {{ $created=(& bcdedit /copy '{{bootmgr}}' /d '{description}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit copy failed: $created" }}; $m=[regex]::Match($created,'\{{[0-9a-fA-F-]+\}}'); if (-not $m.Success) {{ throw "bcdedit did not return a firmware identifier: $created" }}; $id=$m.Value }}
   $device="partition=$($p.DriveLetter):"
   $setDevice=(& bcdedit /set $id device $device | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit device failed: $setDevice" }}
   $setPath=(& bcdedit /set $id path '\EFI\OmarchyInstall\BOOTX64.EFI' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit path failed: $setPath" }}
