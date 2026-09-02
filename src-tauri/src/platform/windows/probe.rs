@@ -1,5 +1,6 @@
 //! Read-only machine probe. Compiled only on Windows.
 
+use super::background_command;
 use crate::error::Result;
 use crate::platform::{
     BitlockerVolume, BlockingReason, DiskMap, MachineProbe, PartitionMap, TargetEsp,
@@ -403,7 +404,7 @@ try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
 "#;
 
 fn inventory_from_powershell() -> Option<Inventory> {
-    let output = std::process::Command::new("powershell")
+    let output = background_command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -682,7 +683,12 @@ fn read_fve(disk: &str, offset: u64) -> Option<bool> {
             None,
         )
         .ok()?;
-        let seek = SetFilePointerEx(handle, i64::try_from(offset).ok()?, None, Default::default());
+        let seek = SetFilePointerEx(
+            handle,
+            i64::try_from(offset).ok()?,
+            None,
+            Default::default(),
+        );
         if seek.is_err() {
             let _ = CloseHandle(handle);
             return None;

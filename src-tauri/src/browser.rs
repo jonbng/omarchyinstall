@@ -69,8 +69,7 @@ pub fn launch(app: &AppHandle, webview_error: &str) -> Result<(), String> {
         .local_addr()
         .map_err(|e| format!("read browser fallback address: {e}"))?;
     let mut token_bytes = [0u8; 32];
-    getrandom::fill(&mut token_bytes)
-        .map_err(|e| format!("create browser session token: {e}"))?;
+    getrandom::fill(&mut token_bytes).map_err(|e| format!("create browser session token: {e}"))?;
     let token = token_bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))

@@ -564,7 +564,7 @@ Goal: one attempt at the installer; if it never starts, Windows still boots.
 
 `Boot####` is an **`EFI_LOAD_OPTION` blob**, not a path string: `UINT32` attributes, `UINT16` filePathListLength, UTF-16 description, device path list `HD(partition,gpt,<PARTUUID of the ESP>)/File(\EFI\OmarchyInstall\BOOTX64.EFI)`, optional extra data. Allocating a free `Boot####` (0000–FFFF, skip existing) and persisting it in `state.json` is required.
 
-**v1 implementation (primary):** `bcdedit /enum firmware` and `bcdedit /set {fwbootmgr} bootsequence {id}` — the documented Windows equivalent of BootNext — plus creating a firmware application entry that points at `\EFI\OmarchyInstall\BOOTX64.EFI`. Packing `EFI_LOAD_OPTION` ourselves via `SetFirmwareEnvironmentVariableEx` is the right API family and a **follow-up** if bcdedit is insufficient; do not treat the raw blob as a footnote and then leave implementers to invent it.
+**v1 implementation (primary):** copy `{bootmgr}` with `bcdedit /copy {bootmgr} /d ...`, repoint that firmware-visible entry to `\EFI\OmarchyInstall\BOOTX64.EFI`, then use `bcdedit /set {fwbootmgr} bootsequence {id}` — the documented Windows equivalent of BootNext. `bcdedit /create ... /application firmware` is invalid on current Windows and can misleadingly exit successfully without yielding an identifier. Packing `EFI_LOAD_OPTION` ourselves via `SetFirmwareEnvironmentVariableEx` is the right API family and a **follow-up** if bcdedit is insufficient.
 
 Privilege `SE_SYSTEM_ENVIRONMENT_NAME` must be enabled on the token (Administrator is necessary, not sufficient). Probe EFI variable writes **before** shrink. Some vendors lock NVRAM; some Hyper-V SKUs do not expose it. Fail closed.
 
@@ -668,7 +668,7 @@ The app substitutes the real `OMARCHYINST` GPT GUID and a `copytoram_size` of `m
 | Filesystem | **FAT32** (files are kilobytes; the 4 GiB cap is irrelevant) |
 | Label | `cidata` (Windows Format may write `CIDATA`; the loader accepts both) |
 | Drive letter | None. Access via `\\?\Volume{GUID}\` |
-| Windows exposure | Hidden + no-default-drive-letter. FAT32 cannot enforce an Administrators+SYSTEM DACL; treat it as a **secret** and delete it on abort. |
+| Windows exposure | No-default-drive-letter, but non-hidden so its saved volume GUID remains reachable. FAT32 cannot enforce an Administrators+SYSTEM DACL; treat it as a **secret** and delete it on abort. |
 | GPT name | `cidata` |
 
 Do not put cidata files on `OMARCHYINST` (NTFS, wrong label). Do not require an ISO patch to `omarchy-cidata-load`.
@@ -1257,8 +1257,8 @@ Closest prior art for “ISO file on a partition + GRUB + `img_loop`.”
 | Frontend-supplied hash/URL (SSRF / fake verify) | High | Pin URL and dest in Rust; parse sidecar in Rust |
 | Overwriting `EFI/Microsoft` | High | Path allow-list: `EFI/OmarchyInstall/`, `boot/grub/grub.cfg`, and the **journaled** search-bait path. Tests assert Microsoft still exists on abort |
 | Permanent BootOrder hijack | High | Do not prepend. BootNext; append-only escape hatch |
-| BitLocker recovery hell / half-encrypted shrink | High | Refuse unless ConversionStatus 0; re-probe before mutate |
-| Credentials / LUKS passphrase on cidata | High | FAT `cidata` volume is hidden and has no default drive letter; FAT32 has no ACL security boundary. Hash `$6$` in Rust; **no plaintext in `state.json`**. ISO still puts the LUKS passphrase in JSON plaintext — delete the volume on abort; wipe destroys it on success. |
+| BitLocker recovery hell / half-encrypted shrink | High | Strongly recommend full decryption; otherwise require explicit recovery/rollback-risk acknowledgement and re-probe before mutate |
+| Credentials / LUKS passphrase on cidata | High | FAT `cidata` volume has no default drive letter but remains non-hidden so its saved volume GUID works; FAT32 has no ACL security boundary. Hash `$6$` in Rust; **no plaintext in `state.json`**. ISO still puts the LUKS passphrase in JSON plaintext — delete the volume on abort; wipe destroys it on success. |
 | Intel RST / VMD | High | Always block (`BlockingReason::Rst`). No install onto RAID metadata. |
 | Support bundle leaking hostname / disk serials | Low | Include them (needed to debug); user-initiated upload only |
 | Running un-elevated and failing midway | Medium | `windows.manifest` requireAdministrator + `runas` relaunch |
@@ -1461,7 +1461,7 @@ Incremental PRs against this Tauri repo. **No mutate-capable merge until PR 7a�
 - Frontend: enable mutate behind confirms
 - Tests: size formula includes 64 MiB cidata; refuse FAT32 for `OMARCHYINST`; cidata is FAT32 labeled `cidata`
 
-**Description:** Hibernate/Fast Startup handling (journal previous values). QueryMax; shrink to `OMARCHYINST` formula **plus ~64 MiB**; create NTFS `OMARCHYINST` and FAT32 `cidata`; no drive letters. **No pagefile reboot.** Refuse BitLocker, **RST**, dynamic, non-GPT, non-UEFI. Re-probe BitLocker immediately before shrink. Cidata volume may be empty until PR 5b.
+**Description:** Hibernate/Fast Startup handling (journal previous values). QueryMax; shrink to `OMARCHYINST` formula **plus ~64 MiB**; create NTFS `OMARCHYINST` and FAT32 `cidata`; no drive letters. **No pagefile reboot.** Warn and require explicit acknowledgement for BitLocker; refuse **RST**, dynamic, non-GPT, and non-UEFI. Re-probe BitLocker immediately before shrink. Cidata volume may be empty until PR 5b.
 
 ---
 

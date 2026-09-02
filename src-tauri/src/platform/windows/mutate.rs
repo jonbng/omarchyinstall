@@ -1,6 +1,6 @@
 //! Disk staging, cidata, BootNext, rollback. Compiled only on Windows.
 
-use super::host_info;
+use super::{background_command, host_info};
 use crate::cidata::{self, CidataIdentity};
 use crate::download;
 use crate::error::{Error, Result};
@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
@@ -46,7 +45,7 @@ fn save_journal(journal: &StateJournal) -> Result<()> {
 }
 
 fn powershell(script: &str) -> Result<String> {
-    let output = Command::new("powershell")
+    let output = background_command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -324,7 +323,7 @@ if ([uint64]$p.Size -ne [uint64]{size}) {{ throw 'partition at planned offset ha
 $v=$null
 try {{ $v=Get-Volume -Partition $p -ErrorAction Stop }} catch {{}}
 if (-not $v -or [string]$v.FileSystemType -ne '{filesystem}' -or [string]$v.FileSystemLabel -ne '{label}') {{ Format-Volume -Partition $p -FileSystem {filesystem} -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null; $v=Get-Volume -Partition $p }}
-Set-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -NoDefaultDriveLetter $true -IsHidden ${hidden}
+Set-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -NoDefaultDriveLetter $true -IsHidden {hidden}
 $p=Get-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber
 if ($p.DriveLetter) {{ Remove-PartitionAccessPath -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -AccessPath ($p.DriveLetter + ':\') }}
 $p=Get-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber
@@ -620,7 +619,9 @@ try {{
 }
 
 pub fn reboot_to_installer() -> Result<()> {
-    let status = Command::new("shutdown").args(["/r", "/t", "0"]).status()?;
+    let status = background_command("shutdown")
+        .args(["/r", "/t", "0"])
+        .status()?;
     if !status.success() {
         return Err(Error::Message("shutdown /r failed".into()));
     }
@@ -808,7 +809,7 @@ pub fn export_support_bundle() -> Result<PathBuf> {
 }
 
 fn diagnostic_output(program: &str, args: &[&str]) -> String {
-    match Command::new(program).args(args).output() {
+    match background_command(program).args(args).output() {
         Ok(output) => format!(
             "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code(),

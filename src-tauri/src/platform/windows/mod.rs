@@ -4,10 +4,20 @@ mod elevation;
 mod mutate;
 mod probe;
 
+use std::ffi::OsStr;
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+
 use super::{
     BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
     StageResult, StateJournal,
 };
+
+fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+    command
+}
 use crate::cidata::CidataIdentity;
 use crate::error::{Error, Result};
 use windows::{
@@ -37,7 +47,7 @@ pub fn relaunch_elevated() -> Result<()> {
 }
 
 pub fn reboot_to_firmware() -> Result<()> {
-    let status = std::process::Command::new("shutdown")
+    let status = background_command("shutdown")
         .args(["/r", "/fw", "/t", "0"])
         .status()?;
     if !status.success() {
@@ -77,7 +87,7 @@ if ($picker.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   [Console]::Out.Write($picker.FileName)
 }
 "#;
-    let output = std::process::Command::new("powershell.exe")
+    let output = background_command("powershell.exe")
         .args(["-NoProfile", "-STA", "-Command", script])
         .output()?;
     if !output.status.success() {
