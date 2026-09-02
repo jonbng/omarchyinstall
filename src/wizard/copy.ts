@@ -135,7 +135,7 @@ export function abortCopy(kind: AbortKind, native: boolean): AbortCopy {
         kicker: "abort",
         title: "Abort omarchy-install?",
         body: native
-          ? "Nothing has been written to disk yet. Windows is untouched."
+          ? "The Windows installation has not been changed. A partial ISO download may remain in the cache and will resume next time."
           : "This is a dry run. Exiting does not change this machine.",
         confirm: "Exit",
         cancel: "Stay",

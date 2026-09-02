@@ -71,7 +71,7 @@ export function identityOk(username: string, hostname: string, password: string,
   );
 }
 
-export type InstallStart = "download" | "stage" | "cidata" | "bootnext" | "done";
+export type InstallStart = "prepare" | "stage" | "cidata" | "bootnext" | "done";
 
 export function installStartFromJournal(step: string | undefined): InstallStart {
   switch (step) {
@@ -84,6 +84,6 @@ export function installStartFromJournal(step: string | undefined): InstallStart 
     case "cidataPartitionCreated":
       return "stage";
     default:
-      return "download";
+      return "prepare";
   }
 }

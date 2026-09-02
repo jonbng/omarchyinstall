@@ -405,8 +405,10 @@ try {{
   New-Item -ItemType Directory -Force -Path $destDir | Out-Null
   Copy-Item -Force $src ($destDir + '\BOOTX64.EFI')
   $baitRel = '{}'
-  $baitDest = '{}' + ($baitRel.TrimStart('/').Replace('/','\'))
-  New-Item -ItemType Directory -Force -Path (Split-Path $baitDest) | Out-Null
+  $baitRelWindows = $baitRel.TrimStart('/').Replace('/','\')
+  $baitDest = '{}' + $baitRelWindows
+  $baitParentRel = Split-Path -Parent $baitRelWindows
+  if ($baitParentRel) {{ New-Item -ItemType Directory -Force -Path ('{}' + $baitParentRel) | Out-Null }}
   $baitSrc = $letter + ':{}'
   if (-not (Test-Path -LiteralPath $baitSrc)) {{ throw 'discovered ISO search bait is missing' }}
   Copy-Item -Force $baitSrc $baitDest
@@ -417,6 +419,7 @@ try {{
         iso_src.display().to_string().replace('\'', "''"),
         esp_root.replace('\'', "''"),
         search.replace('\'', "''"),
+        esp_root.replace('\'', "''"),
         esp_root.replace('\'', "''"),
         search.replace('/', "\\").replace('\'', "''"),
         iso_src.display().to_string().replace('\'', "''"),

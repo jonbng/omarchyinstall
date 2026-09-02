@@ -11,12 +11,13 @@ For the complete design, safety model, and current engineering constraints, see 
 
 ## What it does
 
-1. Checks that the PC and Windows disk are supported.
-2. Collects the account and installation settings needed by Omarchy.
-3. Downloads the latest official Omarchy ISO and verifies its SHA-256 checksum and GPG signature.
-4. Shrinks the Windows partition and creates temporary installer and configuration partitions.
-5. Stages the ISO bootloader without modifying `EFI/Microsoft` and configures a one-time UEFI boot entry.
-6. Reboots into the official Omarchy installer, which wipes the target disk and installs Omarchy normally.
+1. Starts downloading the latest official Omarchy ISO, or verifies a local official ISO selected on the welcome screen.
+2. Checks that the PC and Windows disk are supported while media preparation continues in the background.
+3. Collects the account and installation settings needed by Omarchy.
+4. Waits for the ISO to pass its SHA-256 and GPG checks before showing the final disk review and erase confirmation.
+5. Shrinks the Windows partition and creates temporary installer and configuration partitions.
+6. Stages the ISO bootloader without modifying `EFI/Microsoft` and configures a one-time UEFI boot entry.
+7. Reboots into the official Omarchy installer, which wipes the target disk and installs Omarchy normally.
 
 Windows is only the bootstrap environment. Omarchy is not installed inside an NTFS file, and Windows is not retained.
 
@@ -41,9 +42,10 @@ Intel RST/VMD/RAID, Dynamic Disks, Storage Spaces, legacy BIOS, and ARM Windows 
 3. Download `OmarchyInstaller-windows-x64.exe` from the [latest GitHub Release](https://github.com/jonbng/omarchyinstall/releases/latest).
 4. Optionally verify the download against the accompanying `.sha256` file.
 5. Open the executable normally and approve the Administrator prompt. The executable requests elevation automatically and is portable; there is no setup program to install.
-6. Follow the wizard, review the selected disk carefully, and enter `ERASE WINDOWS` only when you are ready for that disk to be erased.
-7. Leave the PC connected to power and the network while the ISO is downloaded, verified, and staged.
-8. At the final prompt, reboot into the installer. Once the live Omarchy installer starts, the Windows installation cannot be recovered by this app.
+6. On the welcome screen, use the latest official ISO or choose an official ISO already on the PC. The download or verification continues while you complete the machine check and setup questions.
+7. After the media is verified, review the selected disk carefully and enter `ERASE WINDOWS` only when you are ready for that disk to be erased.
+8. Leave the PC connected to power and the network while the ISO is downloaded, verified, and staged.
+9. At the final prompt, reboot into the installer. Once the live Omarchy installer starts, the Windows installation cannot be recovered by this app.
 
 Releases are currently unsigned, so Windows SmartScreen may display a warning. If the WebView2 runtime is unavailable, the same locally authenticated interface opens in the default browser.
 

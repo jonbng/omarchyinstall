@@ -209,6 +209,21 @@ This would make it easier to answer exactly what was tested and shipped.
 - Identity-based repair or replacement of a recognized previous installation.
 - Requiring a second successful boot during physical qualification.
 
+## UX flow observation adopted for evaluation
+
+The Apple installer prepares and verifies its payload before presenting the destructive plan. That ordering is an observation, not evidence that the rest of its UI or implementation is correct.
+
+Omarchy Install is adopting a related but independently designed flow:
+
+1. The welcome screen chooses the latest official ISO or a local official ISO.
+2. Clicking **Begin installation** starts acquisition and verification.
+3. Machine checks and account configuration continue while that work runs in the background.
+4. A persistent status strip reports real download and verification state.
+5. The review step waits until the media is verified before exposing `ERASE WINDOWS`.
+6. The media is checked again immediately before the first disk mutation.
+
+This is intentionally not a direct copy. Unlike the Apple installer, Omarchy Install does not require a dedicated blocking download screen, and it retains the stronger typed erase phrase. The flow still needs independent usability testing, failure testing, and physical Windows qualification.
+
 ## What should not be copied directly
 
 - Direct installation of custom final-system images.
