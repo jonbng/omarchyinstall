@@ -128,7 +128,7 @@ export async function getVersion(): Promise<string> {
     return api.getVersion();
   }
   if (runtimeMode() === "browser") return invoke<string>("_version");
-  return "0.4.1";
+  return "0.4.2";
 }
 
 export async function closeApp() {

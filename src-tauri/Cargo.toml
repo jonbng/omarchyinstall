@@ -1,6 +1,6 @@
 [package]
 name = "omarchyinstall"
-version = "0.4.1"
+version = "0.4.2"
 description = "Portable Windows-to-Omarchy bootstrap app (Tauri 2)."
 authors = ["Jonathan"]
 edition = "2021"
