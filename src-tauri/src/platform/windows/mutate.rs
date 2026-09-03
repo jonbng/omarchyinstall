@@ -1,10 +1,18 @@
 //! Disk staging, cidata, BootNext, rollback. Compiled only on Windows.
 
-use super::{background_command, host_info};
+use super::{
+    host_info,
+    iso_mount::MountedIso,
+    process::{run_storage_powershell, system_command, SystemTool},
+    registry::{get_hklm_dword, set_hklm_dword},
+};
 use crate::cidata::{self, CidataIdentity};
 use crate::download;
 use crate::error::{Error, Result};
-use crate::grub::{self, emit_grub_cfg, ESP_GRUB_CFG, ESP_GRUB_EFI};
+use crate::grub::{
+    self, emit_windows_vm_grub_cfg, ESP_GRUB_CFG, ESP_GRUB_EFI, VM_INITRAMFS_FAT_PATH,
+    VM_INITRAMFS_ISO_PATH, VM_KERNEL_FAT_PATH, VM_KERNEL_ISO_PATH,
+};
 use crate::journal::{
     self, empty_journal, interpret_rollback_output, parse_journal, serialize_journal,
 };
@@ -20,8 +28,15 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use windows::core::w;
 use zip::write::FileOptions;
 use zip::ZipWriter;
+
+const POWER_SESSION_KEY: windows::core::PCWSTR =
+    w!("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power");
+const POWER_KEY: windows::core::PCWSTR = w!("SYSTEM\\CurrentControlSet\\Control\\Power");
+const HIBERBOOT_ENABLED: windows::core::PCWSTR = w!("HiberbootEnabled");
+const HIBERNATE_ENABLED: windows::core::PCWSTR = w!("HibernateEnabled");
 
 fn local_app_dir() -> Result<PathBuf> {
     paths::install_data_dir()
@@ -44,26 +59,6 @@ fn save_journal(journal: &StateJournal) -> Result<()> {
     journal::save_atomic(&journal_path()?, journal)
 }
 
-fn powershell(script: &str) -> Result<String> {
-    let output = background_command("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(Error::Message(format!(
-            "powershell failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn volume_root(unique_id: &str) -> Result<String> {
     windows_volume_path(unique_id)
 }
@@ -72,12 +67,7 @@ fn volume_reachable(unique_id: &str) -> bool {
     let Ok(path) = windows_volume_path(unique_id) else {
         return false;
     };
-    powershell(&format!(
-        "if (Test-Path -LiteralPath '{}') {{ 'yes' }} else {{ 'no' }}",
-        path.replace('\'', "''")
-    ))
-    .map(|s| s.trim().eq_ignore_ascii_case("yes"))
-    .unwrap_or(false)
+    fs::metadata(path).is_ok()
 }
 
 fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Option<PrepareResult> {
@@ -105,6 +95,13 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
 
 pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
     let probe = crate::platform::probe_machine()?;
+    let probed_linux_device = probe
+        .linux_by_id
+        .as_deref()
+        .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
+    // This branch is intentionally a single-machine bridge until the ISO-side
+    // by-id canonicalization is released.  Refuse before touching C: elsewhere.
+    cidata::windows_vm_archinstall_device(probed_linux_device)?;
     if probe.bitlocker.iter().any(|volume| !volume.fully_decrypted) && !allow_bitlocker {
         return Err(Error::Message(
             "BitLocker is still enabled. Turn it off (recommended), or explicitly accept the BitLocker recovery risk before continuing."
@@ -187,23 +184,14 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
 
     if matches!(journal.step, JournalStep::Planned) {
         if journal.hiberboot_was.is_none() {
-            journal.hiberboot_was = powershell(
-                r#"(Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled"#,
-            )
-            .ok()
-            .and_then(|s| s.parse().ok());
-            journal.hibernation_disabled_by_us = powershell(
-                r#"(Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name HibernateEnabled -ErrorAction SilentlyContinue).HibernateEnabled"#,
-            )
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .is_some_and(|v| v != 0);
+            journal.hiberboot_was = get_hklm_dword(POWER_SESSION_KEY, HIBERBOOT_ENABLED);
+            journal.hibernation_disabled_by_us =
+                get_hklm_dword(POWER_KEY, HIBERNATE_ENABLED).is_some_and(|v| v != 0);
         }
         journal.pending_operation = Some(PendingOperation::DisablePower);
         save_journal(&journal)?;
-        powershell(
-            r#"$ErrorActionPreference='Stop'; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -Value 0 -Type DWord; powercfg /h off | Out-Null; 'ok'"#,
-        )?;
+        set_hklm_dword(POWER_SESSION_KEY, HIBERBOOT_ENABLED, 0)?;
+        run_powercfg("off")?;
         journal.pending_operation = None;
         journal.step = JournalStep::PowerPrepared;
         save_journal(&journal)?;
@@ -212,7 +200,7 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     if matches!(journal.step, JournalStep::PowerPrepared) {
         journal.pending_operation = Some(PendingOperation::ShrinkWindows);
         save_journal(&journal)?;
-        powershell(&format!(
+        run_storage_powershell(&format!(
             r#"$ErrorActionPreference='Stop'; $d=Get-Disk -Number {disk_number}; if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}; $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}; if (-not $c) {{ throw 'Windows partition disappeared' }}; if ([uint64]$c.Size -eq [uint64]{old_c}) {{ $supported=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber; if ([uint64]{new_c} -lt [uint64]$supported.SizeMin) {{ throw 'unmovable files; Windows will not shrink C: enough' }}; Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{new_c}) }} elseif ([uint64]$c.Size -ne [uint64]{new_c}) {{ throw 'Windows partition size does not match journal' }}; 'ok'"#,
             disk_guid = ps_guid(&disk_guid),
             windows_guid = ps_guid(&windows_guid),
@@ -311,7 +299,7 @@ fn create_or_recover_partition(
     label: &str,
     hidden: bool,
 ) -> Result<serde_json::Value> {
-    let raw = powershell(&format!(
+    let raw = run_storage_powershell(&format!(
         r#"
 $ErrorActionPreference='Stop'
 $d=Get-Disk -Number {disk_number}
@@ -364,67 +352,87 @@ pub fn stage_bootloader() -> Result<StageResult> {
     }
     let iso_size = fs::metadata(&dest_iso)?.len();
     partition::iso_fits_omarchyinst(iso_size, partition::omarchyinst_bytes(iso_size))?;
+    let stable_device = required(&journal.linux_device, "Linux stable disk identity")?;
+    cidata::windows_vm_archinstall_device(stable_device)?;
+    if required_u64(journal.cidata_size_bytes, "cidata size")? < partition::CIDATA_BYTES {
+        return Err(Error::Message(
+            "the existing cidata partition is from the old 64 MiB layout; undo it and prepare again"
+                .into(),
+        ));
+    }
 
-    let listing = powershell(&format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$img = Mount-DiskImage -ImagePath '{}' -PassThru
-try {{
-  $letter = ($img | Get-Volume).DriveLetter
-  Get-ChildItem -Path ($letter + ':\') -Recurse -File | ForEach-Object {{
-    $_.FullName.Substring(2)
-  }}
-}} finally {{
-  Dismount-DiskImage -ImagePath '{}' | Out-Null
-}}
-"#,
-        iso_src.display().to_string().replace('\'', "''"),
-        iso_src.display().to_string().replace('\'', "''"),
-    ))?;
-    let paths: Vec<&str> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let search = grub::discover_search_filename(paths.iter().copied())?;
+    let mounted_iso = MountedIso::attach(&iso_src)?;
+    let iso_paths = collect_relative_files(mounted_iso.root())?;
+    let search = grub::discover_search_filename(iso_paths.iter().map(String::as_str))?;
     for dest in grub::esp_stage_destinations(&search)? {
         grub::assert_esp_write_allowed(&dest)?;
     }
+    let bait_windows = grub::esp_bait_windows_path(&search)?;
+    journal.search_filename = Some(search.clone());
+    save_journal(&journal)?;
 
     let esp = required(&journal.esp_volume_guid, "target ESP volume GUID")?.to_string();
     validate_esp_identity(&journal)?;
     let esp_root = volume_root(&esp)?;
-    let efi_src_copy = powershell(&format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$img = Mount-DiskImage -ImagePath '{}' -PassThru
-try {{
-  $letter = ($img | Get-Volume).DriveLetter
-  $src = $letter + ':\EFI\BOOT\BOOTX64.EFI'
-  $destDir = '{}' + 'EFI\OmarchyInstall'
-  New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-  Copy-Item -Force $src ($destDir + '\BOOTX64.EFI')
-  $baitRel = '{}'
-  $baitRelWindows = $baitRel.TrimStart('/').Replace('/','\')
-  $baitDest = '{}' + $baitRelWindows
-  $baitParentRel = Split-Path -Parent $baitRelWindows
-  if ($baitParentRel) {{ New-Item -ItemType Directory -Force -Path ('{}' + $baitParentRel) | Out-Null }}
-  $baitSrc = $letter + ':{}'
-  if (-not (Test-Path -LiteralPath $baitSrc)) {{ throw 'discovered ISO search bait is missing' }}
-  Copy-Item -Force $baitSrc $baitDest
-}} finally {{
-  Dismount-DiskImage -ImagePath '{}' | Out-Null
-}}
-"#,
-        iso_src.display().to_string().replace('\'', "''"),
-        esp_root.replace('\'', "''"),
-        search.replace('\'', "''"),
-        esp_root.replace('\'', "''"),
-        esp_root.replace('\'', "''"),
-        search.replace('/', "\\").replace('\'', "''"),
-        iso_src.display().to_string().replace('\'', "''"),
-    ));
-    let _ = efi_src_copy?;
+    let efi_dest = PathBuf::from(format!("{}{}", esp_root, ESP_GRUB_EFI.replace('/', "\\")));
+    let efi_dest_dir = efi_dest
+        .parent()
+        .ok_or_else(|| Error::Message("GRUB EFI destination has no parent directory".into()))?;
+    // PowerShell's filesystem provider rejects directory creation through some
+    // valid volume-GUID paths. Rust passes these verbatim paths to Windows.
+    fs::create_dir_all(efi_dest_dir)?;
+    if let Some((parent, _)) = bait_windows
+        .rsplit_once('\\')
+        .filter(|(parent, _)| !parent.is_empty())
+    {
+        fs::create_dir_all(PathBuf::from(format!("{esp_root}{parent}")))?;
+    }
+    let efi_src = mounted_iso
+        .root()
+        .join("EFI")
+        .join("BOOT")
+        .join("BOOTX64.EFI");
+    if !efi_src.is_file() {
+        return Err(Error::Message(
+            "mounted ISO is missing EFI/BOOT/BOOTX64.EFI".into(),
+        ));
+    }
+    let bait_src = mounted_iso.root().join(&bait_windows);
+    if !bait_src.is_file() {
+        return Err(Error::Message(
+            "discovered ISO search bait is missing".into(),
+        ));
+    }
+    fs::copy(efi_src, &efi_dest)?;
+    fs::copy(bait_src, PathBuf::from(format!("{esp_root}{bait_windows}")))?;
+
+    let cidata_guid = required(&journal.cidata_guid, "cidata volume GUID")?;
+    validate_staging_volume(
+        &journal,
+        required(&journal.cidata_partuuid, "cidata PARTUUID")?,
+        cidata_guid,
+        "cidata",
+        "FAT32",
+        false,
+    )?;
+    let cidata_root = volume_root(cidata_guid)?;
+    let cidata_partition_number = staging_partition_number(
+        &journal,
+        required(&journal.cidata_partuuid, "cidata PARTUUID")?,
+    )?;
+    copy_vm_boot_file(
+        mounted_iso.root(),
+        VM_KERNEL_ISO_PATH,
+        &cidata_root,
+        VM_KERNEL_FAT_PATH,
+    )?;
+    copy_vm_boot_file(
+        mounted_iso.root(),
+        VM_INITRAMFS_ISO_PATH,
+        &cidata_root,
+        VM_INITRAMFS_FAT_PATH,
+    )?;
+    drop(mounted_iso);
 
     let partuuid = journal
         .omarchyinst_partuuid
@@ -436,7 +444,7 @@ try {{
                 "OMARCHYINST PARTUUID missing; Get-Partition.Guid was not journaled".into(),
             )
         })?;
-    let cfg = emit_grub_cfg(&partuuid, iso_size);
+    let cfg = emit_windows_vm_grub_cfg(&partuuid, cidata_partition_number, iso_size);
     let cfg_path = PathBuf::from(format!("{}{}", esp_root, ESP_GRUB_CFG.replace('/', "\\")));
     if let Some(parent) = cfg_path.parent() {
         fs::create_dir_all(parent)?;
@@ -445,11 +453,9 @@ try {{
     let mut hasher = Sha256::new();
     hasher.update(cfg.as_bytes());
     let grub_cfg_sha256 = format!("{:x}", hasher.finalize());
-    journal.search_filename = Some(search.clone());
     journal.pending_operation = None;
     journal.step = crate::platform::JournalStep::Staged;
     save_journal(&journal)?;
-    let _ = ESP_GRUB_EFI;
     Ok(StageResult {
         esp_guid: esp,
         search_filename: search,
@@ -457,12 +463,73 @@ try {{
     })
 }
 
+fn copy_vm_boot_file(
+    iso_root: &std::path::Path,
+    iso_relative: &str,
+    fat_root: &str,
+    fat_relative: &str,
+) -> Result<()> {
+    let source = iso_root.join(iso_relative);
+    if !source.is_file() {
+        return Err(Error::Message(format!(
+            "mounted ISO is missing VM boot file {iso_relative}"
+        )));
+    }
+    let destination = PathBuf::from(format!("{}{}", fat_root, fat_relative.replace('/', "\\")));
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&source, &destination)?;
+    if fs::metadata(&source)?.len() != fs::metadata(&destination)?.len() {
+        return Err(Error::Message(format!(
+            "VM boot file copy was truncated: {fat_relative}"
+        )));
+    }
+    Ok(())
+}
+
+fn staging_partition_number(journal: &StateJournal, part_guid: &str) -> Result<u32> {
+    let disk_number = required_u32(journal.target_disk_number, "target disk number")?;
+    let raw = run_storage_powershell(&format!(
+        r#"$ErrorActionPreference='Stop'; $p=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{part_guid}' }}; if (-not $p) {{ throw 'journaled staging partition disappeared' }}; [string]$p.PartitionNumber"#,
+        part_guid = ps_guid(part_guid),
+    ))?;
+    raw.trim()
+        .parse()
+        .map_err(|_| Error::Message(format!("invalid staging partition number: {raw}")))
+}
+
+fn collect_relative_files(root: &std::path::Path) -> Result<Vec<String>> {
+    fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                visit(root, &path, out)?;
+            } else if entry.file_type()?.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| Error::Message("mounted ISO path escaped its root".into()))?;
+                out.push(format!(
+                    "/{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    Ok(files)
+}
+
 fn validate_esp_identity(journal: &StateJournal) -> Result<()> {
     let disk_number = required_u32(journal.target_disk_number, "target disk number")?;
     let disk_guid = required(&journal.target_disk_guid, "target disk GUID")?;
     let esp_guid = required(&journal.esp_partition_guid, "target ESP partition GUID")?;
     let esp_volume = required(&journal.esp_volume_guid, "target ESP volume GUID")?;
-    powershell(&format!(
+    run_storage_powershell(&format!(
         r#"$ErrorActionPreference='Stop'; $d=Get-Disk -Number {disk_number}; if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}; $p=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{esp_guid}' }}; if (-not $p -or ([string]$p.GptType).Trim('{{}}') -ne 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') {{ throw 'journaled ESP is missing or no longer an ESP' }}; $v=Get-Volume -Partition $p; if ([string]$v.UniqueId -ne '{esp_volume}') {{ throw 'journaled ESP volume identity changed' }}; 'ok'"#,
         disk_guid = ps_guid(disk_guid),
         esp_guid = ps_guid(esp_guid),
@@ -481,7 +548,7 @@ fn validate_staging_volume(
 ) -> Result<()> {
     let disk_number = required_u32(journal.target_disk_number, "target disk number")?;
     let disk_guid = required(&journal.target_disk_guid, "target disk GUID")?;
-    powershell(&format!(
+    run_storage_powershell(&format!(
         r#"$ErrorActionPreference='Stop'; $d=Get-Disk -Number {disk_number}; if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}; $p=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{part_guid}' }}; if (-not $p) {{ throw 'journaled staging partition disappeared' }}; $v=Get-Volume -Partition $p; if ([string]$v.UniqueId -ne '{volume_guid}' -or [string]$v.FileSystemLabel -ne '{label}' -or [string]$v.FileSystemType -ne '{filesystem}') {{ throw 'journaled staging volume identity changed' }}; if (-not $p.NoDefaultDriveLetter -or $p.DriveLetter) {{ throw 'staging volume automount hardening is missing' }}; if ({hidden} -and -not $p.IsHidden) {{ throw 'cidata hidden attribute is missing' }}; 'ok'"#,
         disk_guid = ps_guid(disk_guid),
         part_guid = ps_guid(part_guid),
@@ -516,7 +583,7 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
                 .and_then(|p| p.linux_by_id)
         })
         .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
-    cidata::assert_linux_by_id(&linux)?;
+    let install_device = cidata::windows_vm_archinstall_device(&linux)?;
     let disk_bytes = crate::platform::probe_machine()?
         .disks
         .iter()
@@ -524,7 +591,7 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
         .map(|d| d.size_bytes)
         .unwrap_or(512 * probe::GIB);
     let encrypt = identity.encrypt;
-    let files = cidata::build_cidata_files(&identity, &linux, disk_bytes)?;
+    let files = cidata::build_cidata_files(&identity, install_device, disk_bytes)?;
     identity.password.clear();
     let root = volume_root(&guid)?;
     fs::write(
@@ -551,7 +618,7 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
     )?;
     Ok(CidataResult {
         cidata_guid: guid,
-        linux_device: linux,
+        linux_device: install_device.into(),
         encrypt,
     })
 }
@@ -570,9 +637,10 @@ pub fn set_boot_next() -> Result<BootNextResult> {
     let disk_number = required_u32(journal.target_disk_number, "target disk number")?;
     let esp_guid = required(&journal.esp_partition_guid, "target ESP partition GUID")?;
     let existing = journal.boot_id.as_deref().unwrap_or("");
-    let raw = powershell(&format!(
+    let raw = run_storage_powershell(&format!(
         r#"
 $ErrorActionPreference='Stop'
+$bcdedit=Join-Path ([Environment]::SystemDirectory) 'bcdedit.exe'
 $p=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{esp_guid}' }}
 if (-not $p) {{ throw 'journaled ESP disappeared' }}
 $assigned=$false
@@ -580,14 +648,14 @@ if (-not $p.DriveLetter) {{ $p | Add-PartitionAccessPath -AssignDriveLetter; $as
 try {{
   $id='{existing}'
   if (-not $id) {{
-    $all=(& bcdedit /enum firmware /v | Out-String)
+    $all=(& $bcdedit /enum firmware /v | Out-String)
     foreach ($block in ($all -split '(?:\r?\n){{2,}}')) {{ if ($block -match [regex]::Escape('{description}')) {{ $m=[regex]::Match($block,'\{{[0-9a-fA-F-]+\}}'); if ($m.Success) {{ $id=$m.Value; break }} }} }}
   }}
-  if (-not $id) {{ $created=(& bcdedit /copy '{{bootmgr}}' /d '{description}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit copy failed: $created" }}; $m=[regex]::Match($created,'\{{[0-9a-fA-F-]+\}}'); if (-not $m.Success) {{ throw "bcdedit did not return a firmware identifier: $created" }}; $id=$m.Value }}
+  if (-not $id) {{ $created=(& $bcdedit /copy '{{bootmgr}}' /d '{description}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit copy failed: $created" }}; $m=[regex]::Match($created,'\{{[0-9a-fA-F-]+\}}'); if (-not $m.Success) {{ throw "bcdedit did not return a firmware identifier: $created" }}; $id=$m.Value }}
   $device="partition=$($p.DriveLetter):"
-  $setDevice=(& bcdedit /set $id device $device | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit device failed: $setDevice" }}
-  $setPath=(& bcdedit /set $id path '\EFI\OmarchyInstall\BOOTX64.EFI' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit path failed: $setPath" }}
-  $entry=(& bcdedit /enum $id /v | Out-String); if ($LASTEXITCODE -ne 0 -or $entry -notmatch [regex]::Escape('\EFI\OmarchyInstall\BOOTX64.EFI') -or $entry -notmatch 'partition=') {{ throw 'firmware entry validation failed' }}
+  $setDevice=(& $bcdedit /set $id device $device | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit device failed: $setDevice" }}
+  $setPath=(& $bcdedit /set $id path '\EFI\OmarchyInstall\BOOTX64.EFI' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit path failed: $setPath" }}
+  $entry=(& $bcdedit /enum $id /v | Out-String); if ($LASTEXITCODE -ne 0 -or $entry -notmatch [regex]::Escape('\EFI\OmarchyInstall\BOOTX64.EFI') -or $entry -notmatch 'partition=') {{ throw 'firmware entry validation failed' }}
   @{{ id=$id }} | ConvertTo-Json -Compress
 }} finally {{
   if ($assigned) {{ Remove-PartitionAccessPath -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -AccessPath ($p.DriveLetter + ':\') -ErrorAction SilentlyContinue }}
@@ -607,8 +675,8 @@ try {{
 
     journal.pending_operation = Some(PendingOperation::SetBootNext);
     save_journal(&journal)?;
-    powershell(&format!(
-        r#"$ErrorActionPreference='Stop'; $out=(& bcdedit /set '{{fwbootmgr}}' bootsequence '{}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit bootsequence failed: $out" }}; 'ok'"#,
+    run_storage_powershell(&format!(
+        r#"$ErrorActionPreference='Stop'; $bcdedit=Join-Path ([Environment]::SystemDirectory) 'bcdedit.exe'; $out=(& $bcdedit /set '{{fwbootmgr}}' bootsequence '{}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit bootsequence failed: $out" }}; 'ok'"#,
         boot_id.replace('\'', "''")
     ))?;
     journal.pending_operation = None;
@@ -622,7 +690,7 @@ try {{
 }
 
 pub fn reboot_to_installer() -> Result<()> {
-    let status = background_command("shutdown")
+    let status = system_command(SystemTool::Shutdown)?
         .args(["/r", "/t", "0"])
         .status()?;
     if !status.success() {
@@ -648,7 +716,6 @@ pub fn abort_and_rollback() -> Result<RollbackResult> {
         .map(grub::esp_bait_windows_path)
         .transpose()?;
     let old_c = journal.old_c_size_bytes.unwrap_or(0);
-    let hiber = journal.hiberboot_was.unwrap_or(1);
     let restore_hiber = journal.hibernation_disabled_by_us;
     let bait_remove = bait_win
         .as_ref()
@@ -669,19 +736,20 @@ pub fn abort_and_rollback() -> Result<RollbackResult> {
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
+$bcdedit=Join-Path ([Environment]::SystemDirectory) 'bcdedit.exe'
 $d=Get-Disk -Number {disk_number}
 if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed; refusing rollback' }}
 $bootId='{boot_id}'
 if (-not $bootId -and '{boot_description}') {{
-  $all=(& bcdedit /enum firmware /v | Out-String)
+  $all=(& $bcdedit /enum firmware /v | Out-String)
   foreach ($block in ($all -split '(?:\r?\n){{2,}}')) {{ if ($block -match [regex]::Escape('{boot_description}')) {{ $m=[regex]::Match($block,'\{{[0-9a-fA-F-]+\}}'); if ($m.Success) {{ $bootId=$m.Value; break }} }} }}
 }}
 if ($bootId) {{
-  $fw=(& bcdedit /enum '{{fwbootmgr}}' /v | Out-String)
+  $fw=(& $bcdedit /enum '{{fwbootmgr}}' /v | Out-String)
   $sequence=[regex]::Match($fw,'(?im)^bootsequence\s+(\{{[0-9a-fA-F-]+\}}(?:\r?\n\s+\{{[0-9a-fA-F-]+\}})*)')
-  if ($sequence.Success -and $sequence.Value -match [regex]::Escape($bootId)) {{ $clear=(& bcdedit /deletevalue '{{fwbootmgr}}' bootsequence | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not clear our boot sequence: $clear" }} }}
-  $entry=(& bcdedit /enum $bootId /v 2>&1 | Out-String)
-  if ($LASTEXITCODE -eq 0) {{ $del=(& bcdedit /delete $bootId /cleanup | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not delete firmware entry: $del" }} }}
+  if ($sequence.Success -and $sequence.Value -match [regex]::Escape($bootId)) {{ $clear=(& $bcdedit /deletevalue '{{fwbootmgr}}' bootsequence | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not clear our boot sequence: $clear" }} }}
+  $entry=(& $bcdedit /enum $bootId /v 2>&1 | Out-String)
+  if ($LASTEXITCODE -eq 0) {{ $del=(& $bcdedit /delete $bootId /cleanup | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not delete firmware entry: $del" }} }}
 }}
 if ('{esp_root}') {{
   $esp=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{esp_partition_guid}' }}
@@ -715,7 +783,6 @@ if ({old_c} -gt 0) {{
   if ([uint64]$c.Size -lt [uint64]{old_c}) {{ $supported=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber; if ([uint64]{old_c} -gt [uint64]$supported.SizeMax) {{ throw 'Windows partition cannot be restored to its old size' }}; Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{old_c}) }}
   elseif ([uint64]$c.Size -ne [uint64]{old_c}) {{ throw 'Windows partition is larger than its journaled original size' }}
 }}
-if ({restore}) {{ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -Value {hiber} -Type DWord; powercfg /h on | Out-Null }}
 Write-Output 'ok'
 "#,
         disk_guid = ps_guid(disk_guid),
@@ -732,11 +799,16 @@ Write-Output 'ok'
         ci_offset = ci_offset,
         ci_size = ci_size,
         old_c = old_c,
-        hiber = hiber,
-        restore = if restore_hiber { "$true" } else { "$false" },
     );
-    let out = powershell(&script)?;
-    let result = interpret_rollback_output(true, &out, old_c, restore_hiber)?;
+    let out = run_storage_powershell(&script)?;
+    let restored_power = restore_hiber || journal.hiberboot_was.is_some();
+    let result = interpret_rollback_output(true, &out, old_c, restored_power)?;
+    if restore_hiber {
+        run_powercfg("on")?;
+    }
+    if let Some(value) = journal.hiberboot_was {
+        set_hklm_dword(POWER_SESSION_KEY, HIBERBOOT_ENABLED, value)?;
+    }
     let path = journal_path()?;
     fs::remove_file(path).ok();
     Ok(result)
@@ -764,21 +836,25 @@ pub fn export_support_bundle() -> Result<PathBuf> {
     }
     zip.start_file("host.txt", opts)?;
     zip.write_all(format!("{:?}", host_info()?).as_bytes())?;
-    for (name, program, args) in [
+    for (name, tool, args) in [
         (
             "firmware-bcd.txt",
-            "bcdedit",
+            SystemTool::BcdEdit,
             vec!["/enum", "firmware", "/v"],
         ),
-        ("bitlocker-manage-bde.txt", "manage-bde", vec!["-status"]),
+        (
+            "bitlocker-manage-bde.txt",
+            SystemTool::ManageBde,
+            vec!["-status"],
+        ),
     ] {
         zip.start_file(name, opts)?;
-        zip.write_all(diagnostic_output(program, &args).as_bytes())?;
+        zip.write_all(diagnostic_output(tool, &args).as_bytes())?;
     }
     zip.start_file("bitlocker-wmi.json", opts)?;
     zip.write_all(
         diagnostic_output(
-            "powershell",
+            SystemTool::PowerShell,
             &[
                 "-NoProfile",
                 "-NonInteractive",
@@ -811,14 +887,52 @@ pub fn export_support_bundle() -> Result<PathBuf> {
     Ok(zip_path)
 }
 
-fn diagnostic_output(program: &str, args: &[&str]) -> String {
-    match background_command(program).args(args).output() {
+fn diagnostic_output(tool: SystemTool, args: &[&str]) -> String {
+    match system_command(tool).and_then(|mut command| Ok(command.args(args).output()?)) {
         Ok(output) => format!(
             "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ),
-        Err(error) => format!("failed to execute {program}: {error}"),
+        Err(error) => format!("failed to execute Windows system tool: {error}"),
+    }
+}
+
+fn run_powercfg(state: &str) -> Result<()> {
+    let output = system_command(SystemTool::PowerCfg)?
+        .args(["/h", state])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Message(format!(
+            "powercfg /h {state} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounted_tree_paths_use_iso_separators() {
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-mounted-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let boot = root.join("boot");
+        fs::create_dir_all(&boot).unwrap();
+        fs::write(boot.join("deadbeef.uuid"), []).unwrap();
+
+        let paths = collect_relative_files(&root).unwrap();
+        assert_eq!(paths, ["/boot/deadbeef.uuid"]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -25,11 +25,15 @@ Windows is only the bootstrap environment. Omarchy is not installed inside an NT
 
 The current installer supports PCs with:
 
+> Temporary development limitation: until the ISO-side by-id fix lands, this
+> worktree's destructive path is pinned to the QEMU SATA fixture
+> `ata-QEMU_HARDDISK_QM00001` and refuses other disks before shrinking Windows.
+
 - 64-bit Windows 10 or Windows 11, running on a UEFI/GPT boot disk
 - Administrator access
 - Secure Boot disabled
 - At least 12 GiB of installed RAM and about 10 GiB usable RAM
-- At least 8 GiB plus 64 MiB of shrinkable space on the Windows partition
+- At least 8.5 GiB of shrinkable space on the Windows partition
 - A working internet connection for the roughly 6 GiB Omarchy ISO download
 - BitLocker fully turned off and decrypted on the target disk is strongly recommended; suspending protection is not sufficient, and continuing without decryption requires an explicit recovery-risk acknowledgement
 
@@ -151,3 +155,7 @@ The workflow fails instead of publishing if, for example, tag `v0.2.0` points to
 | `references/` | Upstream and prior-art source checkouts; not shipped |
 
 When adding operating-system-specific behavior, keep it behind `platform/`, expose it through `commands.rs`, and keep Windows-only crates under `[target.'cfg(windows)'.dependencies]`.
+
+### Windows integration boundary
+
+The Windows backend calls Win32/COM directly for the file dialog, registry access, volume-path checks, and read-only ISO attachment. Child processes are resolved from the Windows system directory rather than `PATH`. PowerShell is intentionally retained only for Microsoft Storage cmdlets, BitLocker/TPM CIM inventory, BCD orchestration, rollback operations coupled to storage identity checks, and support diagnostics; these APIs do not have a safer or simpler in-process equivalent for this installer.

@@ -9,6 +9,9 @@ use zeroize::Zeroize;
 
 pub const ESP_OBJ_ID: &str = "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d";
 pub const ROOT_OBJ_ID: &str = "8c2c2b92-1070-455d-b76a-56263bab24aa";
+/// Temporary, deliberately narrow workaround while omarchy-iso#142 is pending.
+pub const WINDOWS_VM_BY_ID: &str = "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00001";
+pub const WINDOWS_VM_ARCHINSTALL_DEVICE: &str = "/dev/sda";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +60,18 @@ pub fn assert_linux_by_id(device: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Archinstall 4.4 drops `/dev/disk/by-id` device keys.  Only the measured
+/// Windows/QEMU fixture is allowed to use its known canonical kernel name.
+pub fn windows_vm_archinstall_device(device: &str) -> Result<&'static str> {
+    assert_linux_by_id(device)?;
+    if device != WINDOWS_VM_BY_ID {
+        return Err(Error::Message(format!(
+            "temporary VM build only supports {WINDOWS_VM_BY_ID}; probed {device}"
+        )));
+    }
+    Ok(WINDOWS_VM_ARCHINSTALL_DEVICE)
 }
 
 pub const MIN_PASSWORD: usize = 6;
@@ -252,10 +267,12 @@ pub fn assert_git_identity(full_name: &Option<String>, email: &Option<String>) -
 
 pub fn build_cidata_files(
     identity: &CidataIdentity,
-    linux_by_id: &str,
+    install_device: &str,
     disk_bytes: u64,
 ) -> Result<CidataFiles> {
-    assert_linux_by_id(linux_by_id)?;
+    if install_device != WINDOWS_VM_ARCHINSTALL_DEVICE {
+        assert_linux_by_id(install_device)?;
+    }
     assert_username(&identity.username)?;
     assert_hostname(&identity.hostname)?;
     assert_password(&identity.password)?;
@@ -303,7 +320,7 @@ pub fn build_cidata_files(
         "disk_config": {
             "config_type": "default_layout",
             "device_modifications": [{
-                "device": linux_by_id,
+                "device": install_device,
                 "wipe": true,
                 "partitions": [
                     {
@@ -470,6 +487,26 @@ mod tests {
         assert!(
             err.contains("PhysicalDrive") || err.contains("by-id"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn exact_windows_vm_uses_archinstall_canonical_device() {
+        assert_eq!(
+            windows_vm_archinstall_device(WINDOWS_VM_BY_ID).unwrap(),
+            "/dev/sda"
+        );
+        assert!(windows_vm_archinstall_device("/dev/disk/by-id/ata-QEMU_HARDDISK_OTHER").is_err());
+        let files = build_cidata_files(
+            &ident(),
+            windows_vm_archinstall_device(WINDOWS_VM_BY_ID).unwrap(),
+            64 * GIB,
+        )
+        .unwrap();
+        let cfg: Value = serde_json::from_str(&files.user_configuration).unwrap();
+        assert_eq!(
+            cfg["disk_config"]["device_modifications"][0]["device"],
+            "/dev/sda"
         );
     }
 

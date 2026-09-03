@@ -152,7 +152,7 @@ This is a **Tauri 2** desktop app: React 19 + Vite frontend, Rust backend. Produ
 | Dev stub | `src-tauri/src/platform/stub.rs` | `elevated: false`, `native_windows: false`, `os_version: None` |
 | Gate | `platform::require_windows()` | Non-Windows → `Error::WindowsOnly` |
 | Tests | `platform/mod.rs`, `error.rs` | `host_info_matches_compile_target`; `windows_only_serializes_as_message`. `bun run check:rust` → `cargo test --manifest-path src-tauri/Cargo.toml` |
-| Windows crate | `src-tauri/Cargo.toml` `[target.'cfg(windows)'.dependencies]` | Features: Foundation, Security, FileSystem, Com, Registry, SystemInformation, Threading |
+| Windows crate | `src-tauri/Cargo.toml` `[target.'cfg(windows)'.dependencies]` | Win32 bindings for security, filesystems, registry, COM shell dialogs, storage IOCTLs, Virtual Disk, system information, and threading |
 | Capabilities | `src-tauri/capabilities/default.json` | `core:default`, `opener:default`, `log:default` on linux/macOS/windows |
 | ISO / Omarchy checkouts | `references/omarchy-iso/`, `references/omarchy/` | Upstream sources this design is constrained by. Not shipped in the Windows bundle. `archiso/` submodule is empty. |
 
@@ -600,7 +600,7 @@ Option 2 (Linux CI `grub-mkstandalone` with `configfile ${cmdpath}/grub.cfg`) is
 
 ### Windows extraction of ISO9660 names
 
-archiso uses xorriso with Joliet + rational Rock Ridge. Windows 10+ `Mount-DiskImage` and a Rust ISO9660/Joliet reader both see those names. ISO9660 Level 1 alone would mangle long names; **prefer Joliet/RR, do not parse only the 8.3 tree.**
+archiso uses xorriso with Joliet + rational Rock Ridge. The Windows backend attaches the verified ISO read-only with the Virtual Disk API, locates its volume by storage device number, and traverses the Windows CDFS view from Rust. No drive letter or PowerShell mount is used. ISO9660 Level 1 alone would mangle long names; the Windows CDFS view must expose the Joliet/Rock Ridge names used below.
 
 | ISO path (Joliet / Rock Ridge) | Destination |
 | --- | --- |

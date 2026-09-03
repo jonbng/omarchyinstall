@@ -190,14 +190,14 @@ fn random_operation_id() -> String {
 
 /// Map rollback process output to a result. Failed undo must not report success.
 pub fn interpret_rollback_output(
-    powershell_ok: bool,
+    storage_ok: bool,
     stdout: &str,
     old_c_size_bytes: u64,
     restore_hiber: bool,
 ) -> Result<RollbackResult> {
-    if !powershell_ok {
+    if !storage_ok {
         return Err(Error::Message(
-            "rollback powershell failed; Windows may still have staging partitions".into(),
+            "rollback storage operation failed; Windows may still have staging partitions".into(),
         ));
     }
     if !stdout.lines().any(|l| l.trim() == "ok") {

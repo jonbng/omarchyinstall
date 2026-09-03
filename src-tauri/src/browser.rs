@@ -301,7 +301,7 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
-        "pick_local_iso" => blocking!(platform::pick_local_iso()),
+        "pick_local_iso" => blocking!(platform::pick_local_iso(None)),
         "prepare_local_iso" => {
             let _operation = state.operation.lock().await;
             let path = args

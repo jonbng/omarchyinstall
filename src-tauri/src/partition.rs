@@ -1,4 +1,4 @@
-//! Installer-partition sizing. OMARCHYINST is NTFS; cidata is a small FAT32 volume.
+//! Installer-partition sizing. OMARCHYINST is NTFS; cidata is a FAT32 volume.
 
 use crate::error::{Error, Result};
 use crate::probe::{GIB, MIB};
@@ -6,7 +6,11 @@ use crate::probe::{GIB, MIB};
 /// Floor for the ISO payload partition.
 pub const OMARCHYINST_MIN: u64 = 8 * GIB;
 /// Second volume for `omarchy-cidata-load` (`/dev/disk/by-label/cidata`).
-pub const CIDATA_BYTES: u64 = 64 * MIB;
+///
+/// Temporarily also holds the 4.0.2 kernel and initramfs.  The QEMU/OVMF test
+/// machine cannot load the kernel through the ISO GRUB's `linux` command, so
+/// GRUB chainloads the kernel's EFI stub from this FAT volume instead.
+pub const CIDATA_BYTES: u64 = 512 * MIB;
 
 /// `max(8 GiB, iso_size * 1.2 + 512 MiB)`.
 pub fn omarchyinst_bytes(iso_size: u64) -> u64 {
@@ -72,7 +76,7 @@ mod tests {
     #[test]
     fn floor_is_8_gib_for_small_isos() {
         assert_eq!(omarchyinst_bytes(1 * GIB), 8 * GIB);
-        assert_eq!(installer_hole_bytes(1 * GIB), 8 * GIB + 64 * MIB);
+        assert_eq!(installer_hole_bytes(1 * GIB), 8 * GIB + 512 * MIB);
     }
 
     #[test]

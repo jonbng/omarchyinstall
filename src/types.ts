@@ -156,9 +156,9 @@ export type StateJournal = {
   bootId: string | null;
 };
 
-export const INSTALLER_HOLE_BYTES = 8 * 1024 ** 3 + 64 * 1024 ** 2;
+export const INSTALLER_HOLE_BYTES = 8 * 1024 ** 3 + 512 * 1024 ** 2;
 export const OMARCHYINST_BYTES = 8 * 1024 ** 3;
-export const CIDATA_BYTES = 64 * 1024 ** 2;
+export const CIDATA_BYTES = 512 * 1024 ** 2;
 
 export const ESP_TYPE = "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}";
 export const WINRE_TYPE = "{de94bba4-06d1-4d40-a16a-bfd50179d6ac}";

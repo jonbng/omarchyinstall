@@ -8,10 +8,27 @@ use std::collections::BTreeSet;
 pub const ESP_GRUB_EFI: &str = "EFI/OmarchyInstall/BOOTX64.EFI";
 pub const ESP_GRUB_CFG: &str = "boot/grub/grub.cfg";
 pub const ISO_LOOP_PATH: &str = "/omarchy.iso";
+pub const VM_KERNEL_ISO_PATH: &str = "arch/boot/x86_64/vmlinuz-linux-t2";
+pub const VM_INITRAMFS_ISO_PATH: &str = "arch/boot/x86_64/initramfs-linux-t2.img";
+pub const VM_KERNEL_FAT_PATH: &str = "EFI/OmarchyInstall/vmlinuz-linux-t2";
+pub const VM_INITRAMFS_FAT_PATH: &str = "EFI/OmarchyInstall/initramfs-linux-t2.img";
 
 pub fn assert_esp_write_allowed(relative: &str) -> Result<()> {
     let n = relative.replace('\\', "/").to_ascii_lowercase();
     let n = n.trim_start_matches('/');
+    if n.is_empty()
+        || n.split('/').any(|component| {
+            component.is_empty()
+                || matches!(component, "." | "..")
+                || component
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        })
+    {
+        return Err(Error::Message(format!(
+            "refusing unsafe ESP relative path: {relative}"
+        )));
+    }
     if n.starts_with("efi/microsoft/") || n == "efi/microsoft" {
         return Err(Error::Message(format!(
             "refusing ESP write to {relative}: never touch EFI/Microsoft"
@@ -185,6 +202,40 @@ menuentry "Omarchy Installer" --id 'archlinux' {{
     )
 }
 
+/// QEMU/OVMF workaround for the measured Windows VM.  Its copied GRUB can
+/// chainload EFI applications but its `linux` loader fails before initramfs is
+/// loaded.  The Linux EFI stub loads the initramfs from the same FAT volume.
+/// `hd0` is intentionally fixture-specific and must not be generalized.
+pub fn emit_windows_vm_grub_cfg(
+    partuuid: &str,
+    cidata_partition_number: u32,
+    iso_bytes: u64,
+) -> String {
+    let size = copytoram_size_spec(iso_bytes);
+    let guid = partuuid.trim().trim_matches(|c| c == '{' || c == '}');
+    format!(
+        r#"insmod part_gpt
+insmod fat
+insmod chain
+
+set default=0
+set timeout=0
+
+menuentry "Omarchy Installer (Windows QEMU workaround)" --id 'archlinux' {{
+    set kernel_part=hd0,gpt{cidata_partition_number}
+    chainloader (${{kernel_part}})/{VM_KERNEL_FAT_PATH} \
+        initrd=\\EFI\\OmarchyInstall\\initramfs-linux-t2.img \
+        archisobasedir=arch \
+        img_dev=PARTUUID={guid} \
+        img_loop={ISO_LOOP_PATH} \
+        copytoram=y \
+        copytoram_size={size} \
+        splash xe.enable_panel_replay=0 initramfs_async=0
+}}
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +251,23 @@ mod tests {
         assert!(!cfg.contains("img_dev=UUID="), "{cfg}");
         assert!(!cfg.contains("/.disk/"), "{cfg}");
         assert!(!cfg.contains("quiet"), "{cfg}");
+    }
+
+    #[test]
+    fn windows_vm_grub_chainloads_the_kernel_efi_stub() {
+        let guid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let cfg = emit_windows_vm_grub_cfg(guid, 5, 6 * 1024 * 1024 * 1024);
+        assert!(cfg.contains("set kernel_part=hd0,gpt5"), "{cfg}");
+        assert!(
+            cfg.contains("chainloader (${kernel_part})/EFI/OmarchyInstall/vmlinuz-linux-t2"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.contains("initrd=\\\\EFI\\\\OmarchyInstall\\\\initramfs-linux-t2.img"),
+            "{cfg}"
+        );
+        assert!(cfg.contains(&format!("img_dev=PARTUUID={guid}")), "{cfg}");
+        assert!(!cfg.contains("\n    linux "), "{cfg}");
     }
 
     #[test]
@@ -249,6 +317,20 @@ mod tests {
     fn microsoft_write_is_rejected() {
         assert!(assert_esp_write_allowed("EFI/Microsoft/Boot/bootmgfw.efi").is_err());
         assert!(assert_esp_write_allowed("EFI/Boot/bootx64.efi").is_err());
+    }
+
+    #[test]
+    fn unsafe_relative_esp_paths_are_rejected() {
+        for path in [
+            "../EFI/Microsoft/Boot/bootmgfw.efi",
+            "boot/../escape.uuid",
+            "boot//escape.uuid",
+            "C:/escape.uuid",
+        ] {
+            assert!(assert_esp_write_allowed(path).is_err(), "{path}");
+        }
+        assert!(assert_esp_write_allowed("root.uuid").is_ok());
+        assert!(assert_esp_write_allowed("boot/deadbeef.uuid").is_ok());
     }
 
     #[test]

@@ -55,8 +55,20 @@ pub async fn download_iso(app: tauri::AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn pick_local_iso() -> Result<Option<std::path::PathBuf>> {
-    platform::pick_local_iso()
+pub fn pick_local_iso(window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>> {
+    #[cfg(windows)]
+    let owner = Some(
+        window
+            .hwnd()
+            .map_err(|error| crate::error::Error::Message(error.to_string()))?
+            .0 as isize,
+    );
+    #[cfg(not(windows))]
+    let owner = {
+        let _ = window;
+        None
+    };
+    platform::pick_local_iso(owner)
 }
 
 #[tauri::command]

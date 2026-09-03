@@ -1,6 +1,6 @@
 //! Read-only machine probe. Compiled only on Windows.
 
-use super::background_command;
+use super::{process::run_storage_powershell, registry::get_hklm_dword};
 use crate::error::Result;
 use crate::platform::{
     BitlockerVolume, BlockingReason, DiskMap, MachineProbe, PartitionMap, TargetEsp,
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_READ, HANDLE},
+        Foundation::{CloseHandle, GENERIC_READ, HANDLE},
         Security::{
             AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
             SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -20,7 +20,6 @@ use windows::{
             FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         },
         System::{
-            Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},
             SystemInformation::{
                 FirmwareTypeUefi, GetFirmwareType, GetPhysicallyInstalledSystemMemory,
                 GlobalMemoryStatusEx, FIRMWARE_TYPE, MEMORYSTATUSEX,
@@ -136,34 +135,13 @@ fn is_uefi() -> bool {
 }
 
 fn secure_boot_enabled() -> bool {
-    if let Some(v) = reg_dword(
+    if let Some(v) = get_hklm_dword(
         w!("SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State"),
         w!("UEFISecureBootEnabled"),
     ) {
         return v != 0;
     }
     false
-}
-
-fn reg_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
-    unsafe {
-        let mut data = 0u32;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let read = RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            subkey,
-            value,
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut data as *mut u32).cast()),
-            Some(&mut size),
-        );
-        if read == ERROR_SUCCESS {
-            Some(data)
-        } else {
-            None
-        }
-    }
 }
 
 fn efi_variables_writable() -> bool {
@@ -267,7 +245,7 @@ fn ram_bytes() -> (u64, u64, u64) {
 fn tpm_present_tbs() -> bool {
     // TBS is optional on some SKUs; the Storage/TPM PowerShell inventory is preferred.
     std::path::Path::new(r"\\.\TPM").exists()
-        || reg_dword(w!("SYSTEM\\CurrentControlSet\\Services\\TPM"), w!("Start")).is_some()
+        || get_hklm_dword(w!("SYSTEM\\CurrentControlSet\\Services\\TPM"), w!("Start")).is_some()
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,25 +382,9 @@ try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
 "#;
 
 fn inventory_from_powershell() -> Option<Inventory> {
-    let output = background_command("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            INVENTORY_PS,
-        ])
-        .output()
+    let stdout = run_storage_powershell(INVENTORY_PS)
+        .inspect_err(|error| log::warn!("storage inventory powershell failed: {error}"))
         .ok()?;
-    if !output.status.success() {
-        log::warn!(
-            "storage inventory powershell failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim())
         .map_err(|e| {
             log::warn!("storage inventory json: {e}");

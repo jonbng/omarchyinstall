@@ -1,23 +1,18 @@
 //! Win32 / Windows API surface. Compiled only on Windows.
 
+mod dialog;
 mod elevation;
+mod iso_mount;
 mod mutate;
 mod probe;
-
-use std::ffi::OsStr;
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+mod process;
+mod registry;
 
 use super::{
     BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
     StageResult, StateJournal,
 };
 
-fn background_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-    command
-}
 use crate::cidata::CidataIdentity;
 use crate::error::{Error, Result};
 use windows::{
@@ -47,7 +42,7 @@ pub fn relaunch_elevated() -> Result<()> {
 }
 
 pub fn reboot_to_firmware() -> Result<()> {
-    let status = background_command("shutdown")
+    let status = process::system_command(process::SystemTool::Shutdown)?
         .args(["/r", "/fw", "/t", "0"])
         .status()?;
     if !status.success() {
@@ -72,34 +67,8 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
     }
 }
 
-pub fn pick_local_iso() -> Result<Option<std::path::PathBuf>> {
-    // Use the system picker here instead of a WebView API so this also works in
-    // the secure browser fallback used on machines without WebView2.
-    let script = r#"
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-Add-Type -AssemblyName System.Windows.Forms
-$picker = New-Object System.Windows.Forms.OpenFileDialog
-$picker.Title = 'Select an already downloaded Omarchy ISO'
-$picker.Filter = 'Omarchy ISO (omarchy-*.iso)|omarchy-*.iso|ISO images (*.iso)|*.iso'
-$picker.CheckFileExists = $true
-$picker.Multiselect = $false
-if ($picker.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::Out.Write($picker.FileName)
-}
-"#;
-    let output = background_command("powershell.exe")
-        .args(["-NoProfile", "-STA", "-Command", script])
-        .output()?;
-    if !output.status.success() {
-        return Err(Error::Message(format!(
-            "ISO file picker failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let path = String::from_utf8(output.stdout)
-        .map_err(|_| Error::Message("ISO file picker returned an invalid path".into()))?;
-    let path = path.trim();
-    Ok((!path.is_empty()).then(|| std::path::PathBuf::from(path)))
+pub fn pick_local_iso(owner: Option<isize>) -> Result<Option<std::path::PathBuf>> {
+    dialog::pick_local_iso(owner)
 }
 
 pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {

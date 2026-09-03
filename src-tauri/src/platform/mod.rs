@@ -232,8 +232,8 @@ pub fn load_install_state() -> crate::error::Result<Option<StateJournal>> {
     imp::load_install_state()
 }
 
-pub fn pick_local_iso() -> crate::error::Result<Option<std::path::PathBuf>> {
-    imp::pick_local_iso()
+pub fn pick_local_iso(owner: Option<isize>) -> crate::error::Result<Option<std::path::PathBuf>> {
+    imp::pick_local_iso(owner)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

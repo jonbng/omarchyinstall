@@ -58,7 +58,7 @@ pub fn reboot_to_firmware() -> Result<()> {
     Err(crate::error::Error::WindowsOnly)
 }
 
-pub fn pick_local_iso() -> Result<Option<PathBuf>> {
+pub fn pick_local_iso(_owner: Option<isize>) -> Result<Option<PathBuf>> {
     Ok(std::env::var_os("OMARCHY_LOCAL_ISO").map(PathBuf::from))
 }
 
