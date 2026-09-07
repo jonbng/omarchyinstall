@@ -141,7 +141,7 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.10");
+  const [version, setVersion] = useState("0.4.11");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
@@ -1000,7 +1000,7 @@ function ProbeStep({
   }, [probing, probeStartedAt]);
 
   const probeElapsed = Math.max(0, Math.floor((now - probeStartedAt) / 1_000));
-  const probeProgress = `checking Windows storage · ${probeElapsed}s · allow up to 90s`;
+  const probeProgress = `checking Windows storage · ${probeElapsed}s · staged safety checks`;
 
   async function exportDiagnostics() {
     setDiagnosticBusy(true);

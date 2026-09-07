@@ -319,8 +319,8 @@ struct PsBitlocker {
     conversion: Option<u32>,
 }
 
-const INVENTORY_PS: &str = r#"
-$ErrorActionPreference = 'SilentlyContinue'
+const DISK_INVENTORY_PS: &str = r#"
+$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
 $disks = @(Get-Disk | ForEach-Object {
   [ordered]@{
@@ -335,6 +335,12 @@ $disks = @(Get-Disk | ForEach-Object {
     guid = [string]$_.Guid
   }
 })
+@{ disks = $disks } | ConvertTo-Json -Depth 4 -Compress
+"#;
+
+const PARTITION_INVENTORY_PS: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
 $parts = @(Get-Partition | ForEach-Object {
   $letter = if ($_.DriveLetter) { [string]$_.DriveLetter } else { $null }
   $vol = $null
@@ -355,75 +361,106 @@ $parts = @(Get-Partition | ForEach-Object {
     volumeUniqueId = if ($vol) { [string]$vol.UniqueId } else { $null }
   }
 })
-$shrink = @()
-foreach ($p in Get-Partition) {
-  if (-not $p.DriveLetter) { continue }
-  try {
-    $s = Get-PartitionSupportedSize -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber
-    $shrink += [ordered]@{
-      diskNumber = [int]$p.DiskNumber
-      sizeMin = [uint64]$s.SizeMin
-      size = [uint64]$p.Size
-    }
-  } catch {}
-}
-$bitlocker = @()
-$bitlockerError = $null
-try {
-  $bitlocker = @(Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop | ForEach-Object {
+@{ partitions = $parts } | ConvertTo-Json -Depth 5 -Compress
+"#;
+
+const SHRINK_INVENTORY_PS: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$systemLetter = $env:SystemDrive.TrimEnd(':')
+$p = Get-Partition -DriveLetter $systemLetter
+$s = Get-PartitionSupportedSize -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber
+$shrink = @([ordered]@{
+  diskNumber = [int]$p.DiskNumber
+  sizeMin = [uint64]$s.SizeMin
+  size = [uint64]$p.Size
+})
+@{ shrink = $shrink } | ConvertTo-Json -Depth 4 -Compress
+"#;
+
+const BITLOCKER_INVENTORY_PS: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$bitlocker = @(Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume | ForEach-Object {
     $device = [string]$_.DeviceID
-    $partMatches = @($parts | Where-Object { $_.volumeUniqueId -eq $device })
-    $part = if ($partMatches.Count -eq 1) { $partMatches[0] } else { $null }
     [ordered]@{
       deviceId = $device
-      diskNumber = if ($part) { [int]$part.diskNumber } else { $null }
       mount = [string]$_.DriveLetter
       protection = [uint32]$_.ProtectionStatus
       conversion = [uint32]$_.ConversionStatus
     }
-  })
-} catch { $bitlockerError = $_.Exception.Message }
-$tpmPresent = $false
-try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
-@{
-  disks = $disks
-  partitions = $parts
-  shrink = $shrink
-  bitlocker = $bitlocker
-  bitlockerError = $bitlockerError
-  tpmPresent = $tpmPresent
-} | ConvertTo-Json -Depth 6 -Compress
+})
+@{ bitlocker = $bitlocker } | ConvertTo-Json -Depth 4 -Compress
 "#;
 
 fn inventory_from_powershell() -> Result<Inventory> {
-    // Storage/CIM initialization on some Windows systems can take more than 45
-    // seconds. Restarting PowerShell at that point throws away useful progress,
-    // so give one read-only process the full bounded budget instead.
-    const INVENTORY_TIMEOUT: Duration = Duration::from_secs(90);
+    let disks = run_inventory_stage("Windows disk inventory", DISK_INVENTORY_PS, 25)?;
+    let partitions = run_inventory_stage(
+        "Windows partition and volume inventory",
+        PARTITION_INVENTORY_PS,
+        25,
+    )?;
+    let shrink = run_inventory_stage("Windows shrink-capacity check", SHRINK_INVENTORY_PS, 25)?;
+    let (bitlocker, bitlocker_error) =
+        match run_inventory_stage("BitLocker WMI", BITLOCKER_INVENTORY_PS, 15) {
+            Ok(stage) => (stage.bitlocker, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
 
+    let mut inventory = Inventory {
+        disks: disks.disks,
+        partitions: partitions.partitions,
+        shrink: shrink.shrink,
+        bitlocker,
+        bitlocker_error,
+        // The native TBS/registry probe remains available without PowerShell.
+        tpm_present: None,
+    };
+    associate_bitlocker_disks(&mut inventory);
+    Ok(inventory)
+}
+
+fn run_inventory_stage(description: &str, script: &str, timeout_seconds: u64) -> Result<Inventory> {
     let started = Instant::now();
     let result =
-        run_storage_powershell_read_only(INVENTORY_PS, INVENTORY_TIMEOUT).and_then(|stdout| {
-            serde_json::from_str(stdout.trim()).map_err(|error| {
-                Error::Message(format!(
-                    "Windows storage inventory returned invalid JSON: {error}"
-                ))
-            })
-        });
+        run_storage_powershell_read_only(script, Duration::from_secs(timeout_seconds), description)
+            .and_then(|stdout| {
+                serde_json::from_str(stdout.trim()).map_err(|error| {
+                    Error::Message(format!("{description} returned invalid JSON: {error}"))
+                })
+            });
     let elapsed_ms = started.elapsed().as_millis();
-
     match &result {
-        Ok(_) => log::info!("storage inventory completed in {elapsed_ms} ms"),
-        Err(error) => log::warn!("storage inventory failed after {elapsed_ms} ms: {error}"),
+        Ok(_) => log::info!("{description} completed in {elapsed_ms} ms"),
+        Err(error) => log::warn!("{description} failed after {elapsed_ms} ms: {error}"),
     }
+    result
+}
 
-    result.map_err(|error| match error {
-        Error::Timeout { .. } => Error::Message(
-            "Windows storage inventory did not finish within 90 seconds. Retry once; if it continues, reboot Windows before trying again."
-                .into(),
-        ),
-        error => Error::Message(format!("Windows storage inventory failed: {error}")),
-    })
+fn associate_bitlocker_disks(inventory: &mut Inventory) {
+    let Some(bitlocker) = inventory.bitlocker.as_mut() else {
+        return;
+    };
+    let parts = inventory.partitions.as_deref().unwrap_or(&[]);
+    for volume in bitlocker {
+        volume.disk_number = parts
+            .iter()
+            .find(|part| {
+                part.volume_unique_id
+                    .as_deref()
+                    .zip(volume.device_id.as_deref())
+                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+                    || part
+                        .drive_letter
+                        .as_deref()
+                        .zip(volume.mount.as_deref())
+                        .is_some_and(|(left, right)| {
+                            left.trim_end_matches(':')
+                                .eq_ignore_ascii_case(right.trim_end_matches(':'))
+                        })
+            })
+            .and_then(|part| part.disk_number);
+    }
 }
 
 fn disks_from_inventory(inv: &Inventory) -> Vec<DiskMap> {
@@ -733,4 +770,38 @@ fn linux_by_id_from_inventory(inv: &Inventory) -> Option<String> {
 
 fn sanitize_id(s: &str) -> String {
     s.trim().replace([' ', '/'], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::windows::process::{system_command, SystemTool};
+
+    #[test]
+    fn staged_inventory_powershell_is_syntactically_valid() {
+        const SCRIPT_ENV: &str = "OMARCHY_INSTALL_PROBE_PS_SYNTAX_TEST";
+        for script in [
+            DISK_INVENTORY_PS,
+            PARTITION_INVENTORY_PS,
+            SHRINK_INVENTORY_PS,
+            BITLOCKER_INVENTORY_PS,
+        ] {
+            let output = system_command(SystemTool::PowerShell)
+                .unwrap()
+                .env(SCRIPT_ENV, script)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[scriptblock]::Create([Environment]::GetEnvironmentVariable('OMARCHY_INSTALL_PROBE_PS_SYNTAX_TEST')) | Out-Null",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
