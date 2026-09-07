@@ -1020,7 +1020,8 @@ $ErrorActionPreference='Stop'
 
 const DISK_IMAGE_DIAGNOSTIC_PS: &str = r#"
 $ErrorActionPreference='Stop'
-@(Get-DiskImage | Select-Object ImagePath,ImageType,Attached,DevicePath,Size,StorageType) | ConvertTo-Json -Depth 4
+@(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_DiskImage |
+  Select-Object ImagePath,ImageType,Attached,DevicePath,Size,StorageType) | ConvertTo-Json -Depth 4
 "#;
 
 const PHYSICAL_DISK_DIAGNOSTIC_PS: &str = r#"
@@ -1142,6 +1143,7 @@ mod tests {
 
     #[test]
     fn support_bundle_powershell_is_syntactically_valid() {
+        const SCRIPT_ENV: &str = "OMARCHY_INSTALL_PS_SYNTAX_TEST";
         for script in [
             STORAGE_DIAGNOSTIC_PS,
             DISK_IMAGE_DIAGNOSTIC_PS,
@@ -1152,12 +1154,12 @@ mod tests {
         ] {
             let output = system_command(SystemTool::PowerShell)
                 .unwrap()
+                .env(SCRIPT_ENV, script)
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "[scriptblock]::Create($args[0]) | Out-Null",
-                    script,
+                    "[scriptblock]::Create([Environment]::GetEnvironmentVariable('OMARCHY_INSTALL_PS_SYNTAX_TEST')) | Out-Null",
                 ])
                 .output()
                 .unwrap();
