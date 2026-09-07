@@ -1,12 +1,13 @@
 //! Read-only machine probe. Compiled only on Windows.
 
 use super::{process::run_storage_powershell_read_only, registry::get_hklm_dword};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::platform::{
     BitlockerVolume, BlockingReason, DiskMap, MachineProbe, PartitionMap, TargetEsp,
 };
 use crate::probe::{self, volume_is_fve};
 use serde::Deserialize;
+use std::time::{Duration, Instant};
 use windows::{
     core::{w, PCWSTR},
     Win32::{
@@ -48,7 +49,13 @@ pub fn probe_machine() -> Result<MachineProbe> {
         false
     };
     let (ram_installed_bytes, ram_total_phys_bytes, ram_avail_bytes) = ram_bytes();
-    let inventory = inventory_from_powershell();
+    let (inventory, inventory_failure) = match inventory_from_powershell() {
+        Ok(inventory) => (Some(inventory), None),
+        Err(error) => {
+            log::warn!("storage inventory failed: {error}");
+            (None, Some(error.to_string()))
+        }
+    };
     let tpm_present = inventory
         .as_ref()
         .and_then(|i| i.tpm_present)
@@ -78,6 +85,8 @@ pub fn probe_machine() -> Result<MachineProbe> {
                 None,
                 vec![BlockingReason::ProbeIncomplete {
                     component: "Windows storage inventory".into(),
+                    detail: inventory_failure
+                        .unwrap_or_else(|| "Windows returned no storage data.".into()),
                 }],
             )
         });
@@ -88,6 +97,10 @@ pub fn probe_machine() -> Result<MachineProbe> {
     {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
             component: "BitLocker WMI".into(),
+            detail: inventory
+                .as_ref()
+                .and_then(|i| i.bitlocker_error.clone())
+                .unwrap_or_else(|| "Windows did not return BitLocker status.".into()),
         });
     }
     if inventory.as_ref().is_some_and(|i| {
@@ -99,6 +112,7 @@ pub fn probe_machine() -> Result<MachineProbe> {
     }) {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
             component: "BitLocker volume-to-disk association".into(),
+            detail: "A BitLocker volume could not be matched to exactly one physical disk.".into(),
         });
     }
 
@@ -381,16 +395,53 @@ try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
 } | ConvertTo-Json -Depth 6 -Compress
 "#;
 
-fn inventory_from_powershell() -> Option<Inventory> {
-    let stdout = run_storage_powershell_read_only(INVENTORY_PS)
-        .inspect_err(|error| log::warn!("storage inventory powershell failed: {error}"))
-        .ok()?;
-    serde_json::from_str(stdout.trim())
-        .map_err(|e| {
-            log::warn!("storage inventory json: {e}");
-            e
-        })
-        .ok()
+fn inventory_from_powershell() -> Result<Inventory> {
+    const ATTEMPTS: u32 = 2;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+
+    probe::retry_timeouts(ATTEMPTS, |attempt| {
+        let started = Instant::now();
+        let result = run_storage_powershell_read_only(INVENTORY_PS, ATTEMPT_TIMEOUT).and_then(
+            |stdout| {
+                serde_json::from_str(stdout.trim()).map_err(|error| {
+                    Error::Message(format!(
+                        "Windows storage inventory returned invalid JSON: {error}"
+                    ))
+                })
+            },
+        );
+        let elapsed_ms = started.elapsed().as_millis();
+
+        match &result {
+            Ok(_) => {
+                log::info!(
+                    "storage inventory attempt {attempt}/{ATTEMPTS} completed in {elapsed_ms} ms"
+                );
+            }
+            Err(Error::Timeout { .. }) if attempt < ATTEMPTS => {
+                log::warn!(
+                    "storage inventory attempt {attempt}/{ATTEMPTS} timed out after {elapsed_ms} ms; retrying"
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "storage inventory attempt {attempt}/{ATTEMPTS} failed after {elapsed_ms} ms: {error}"
+                );
+            }
+        }
+
+        result
+    })
+    .map_err(|failure| match failure.error {
+        Error::Timeout { .. } => Error::Message(format!(
+            "Windows storage inventory timed out twice ({} seconds total). Retry after closing Disk Management, file pickers, and other storage tools.",
+            ATTEMPT_TIMEOUT.as_secs() * u64::from(ATTEMPTS)
+        )),
+        error => Error::Message(format!(
+            "Windows storage inventory failed on attempt {}: {error}",
+            failure.attempt
+        )),
+    })
 }
 
 fn disks_from_inventory(inv: &Inventory) -> Vec<DiskMap> {
@@ -564,6 +615,7 @@ fn target_esp_from_inventory(inv: &Inventory) -> (Option<TargetEsp>, Vec<Blockin
             None,
             vec![BlockingReason::ProbeIncomplete {
                 component: "Windows boot disk identity".into(),
+                detail: "Windows did not identify a boot disk in the storage inventory.".into(),
             }],
         );
     };
@@ -598,6 +650,7 @@ fn target_esp_from_inventory(inv: &Inventory) -> (Option<TargetEsp>, Vec<Blockin
             None,
             vec![BlockingReason::ProbeIncomplete {
                 component: "target GPT disk GUID".into(),
+                detail: "The Windows boot disk did not expose a GPT disk GUID.".into(),
             }],
         );
     };
@@ -609,6 +662,8 @@ fn target_esp_from_inventory(inv: &Inventory) -> (Option<TargetEsp>, Vec<Blockin
             None,
             vec![BlockingReason::ProbeIncomplete {
                 component: "target ESP identity".into(),
+                detail: "The EFI system partition did not expose stable partition and volume identifiers."
+                    .into(),
             }],
         );
     };

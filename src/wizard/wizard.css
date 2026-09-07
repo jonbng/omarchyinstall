@@ -90,6 +90,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .system-overview strong { overflow: hidden; text-overflow: ellipsis; font-size: .9rem; }
 .system-overview small { color: var(--muted); font-size: .68rem; }
 .probe-wait { justify-self: center; color: var(--muted); display: flex; align-items: center; gap: .6rem; }
+.probe-retrying { justify-self: stretch; margin: 0 0 .75rem; font-variant-numeric: tabular-nums; }
 .cursor { width: .55rem; height: .9rem; background: var(--green); animation: blink 1.05s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .blocker { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: .7rem; padding: 1rem; border: 1px solid rgb(var(--rgb-red) / .28); background: var(--err-bg); }
@@ -101,6 +102,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .diagnostic-report { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: .9rem; padding: .9rem 1rem; border: 1px solid var(--line); background: rgb(var(--rgb-storm) / .32); }
 .diagnostic-report strong { font-size: .78rem; }
 .diagnostic-report p { margin: .25rem 0 0; color: var(--muted); font-size: .72rem; line-height: 1.45; text-wrap: pretty; }
+.diagnostic-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .5rem; }
 .optional { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: .9rem; }
 .optional summary { min-height: 2.2rem; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-size: .75rem; list-style: none; }
 .optional summary::-webkit-details-marker { display: none; }

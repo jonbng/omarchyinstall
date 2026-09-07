@@ -1,6 +1,54 @@
 //! Pure probe policy. No Win32 — unit-tested on every host.
 
+#[cfg(any(windows, test))]
+use crate::error::{Error, Result};
 use crate::platform::{BlockingReason, MachineProbe};
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(crate) struct AttemptFailure {
+    pub error: Error,
+    pub attempt: u32,
+}
+
+/// Runs an operation again only when it ends in a typed timeout. Keeping this
+/// policy outside the Windows module makes the retry behavior deterministic in
+/// tests on every host.
+#[cfg(any(windows, test))]
+pub(crate) fn retry_timeouts<T>(
+    attempts: u32,
+    mut operation: impl FnMut(u32) -> Result<T>,
+) -> std::result::Result<T, AttemptFailure> {
+    assert!(attempts > 0, "retry_timeouts requires at least one attempt");
+
+    for attempt in 1..=attempts {
+        match operation(attempt) {
+            Ok(value) => return Ok(value),
+            Err(Error::Timeout { .. }) if attempt < attempts => {}
+            Err(error) => return Err(AttemptFailure { error, attempt }),
+        }
+    }
+
+    unreachable!("retry loop always returns")
+}
+
+/// Refuses consumers that require trustworthy disk identity when any probe
+/// component was incomplete, while preserving the component's actual error.
+#[cfg(any(windows, test))]
+pub(crate) fn require_complete(probe: &MachineProbe) -> Result<()> {
+    if let Some((component, detail)) = probe.blocking_reasons.iter().find_map(|reason| {
+        if let BlockingReason::ProbeIncomplete { component, detail } = reason {
+            Some((component, detail))
+        } else {
+            None
+        }
+    }) {
+        return Err(Error::Message(format!(
+            "{component} check did not complete: {detail} No disk changes were made; run the system check again."
+        )));
+    }
+    Ok(())
+}
 
 /// 12 GiB installed. Machines below the 14 GiB recommendation get a UI warning.
 pub const RAM_INSTALLED_MIN: u64 = 12 * GIB;
@@ -42,7 +90,9 @@ pub fn blocking_reasons(probe: &MachineProbe, check_elevation: bool) -> Vec<Bloc
         && !out.iter().any(|reason| {
             matches!(
                 reason,
-                BlockingReason::MissingEsp { .. } | BlockingReason::AmbiguousEsp { .. }
+                BlockingReason::MissingEsp { .. }
+                    | BlockingReason::AmbiguousEsp { .. }
+                    | BlockingReason::ProbeIncomplete { .. }
             )
         })
     {
@@ -291,11 +341,108 @@ mod tests {
         let mut p = probe();
         p.blocking_reasons = vec![BlockingReason::ProbeIncomplete {
             component: "BitLocker WMI".into(),
+            detail: "access denied".into(),
         }];
         let p = attach_reasons(p, true);
         assert!(p.blocking_reasons.iter().any(|reason| matches!(
             reason,
-            BlockingReason::ProbeIncomplete { component } if component == "BitLocker WMI"
+            BlockingReason::ProbeIncomplete { component, .. } if component == "BitLocker WMI"
         )));
+        assert!(!p
+            .blocking_reasons
+            .iter()
+            .any(|reason| matches!(reason, BlockingReason::MissingEsp { .. })));
+    }
+
+    #[test]
+    fn retry_timeout_then_success() {
+        let mut calls = Vec::new();
+        let value = retry_timeouts(2, |attempt| {
+            calls.push(attempt);
+            if attempt == 1 {
+                Err(Error::Timeout {
+                    description: "inventory".into(),
+                    seconds: 45,
+                })
+            } else {
+                Ok("inventory")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(value, "inventory");
+        assert_eq!(calls, [1, 2]);
+    }
+
+    #[test]
+    fn retry_stops_after_two_timeouts() {
+        let mut calls = 0;
+        let failure = retry_timeouts::<()>(2, |_| {
+            calls += 1;
+            Err(Error::Timeout {
+                description: "inventory".into(),
+                seconds: 45,
+            })
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 2);
+        assert_eq!(failure.attempt, 2);
+        assert!(matches!(failure.error, Error::Timeout { seconds: 45, .. }));
+    }
+
+    #[test]
+    fn retry_does_not_repeat_process_failure() {
+        let mut calls = 0;
+        let failure = retry_timeouts::<()>(2, |_| {
+            calls += 1;
+            Err(Error::Message("PowerShell exited with code 1".into()))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert_eq!(failure.attempt, 1);
+        assert!(matches!(failure.error, Error::Message(_)));
+    }
+
+    #[test]
+    fn retry_does_not_repeat_malformed_json() {
+        let mut calls = 0;
+        let failure = retry_timeouts::<serde_json::Value>(2, |_| {
+            calls += 1;
+            serde_json::from_str("not json").map_err(|error| Error::Message(error.to_string()))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert_eq!(failure.attempt, 1);
+        assert!(matches!(failure.error, Error::Message(_)));
+    }
+
+    #[test]
+    fn retry_returns_first_attempt_success_without_repeating() {
+        let mut calls = 0;
+        let value = retry_timeouts(2, |attempt| {
+            calls += 1;
+            Ok(attempt)
+        })
+        .unwrap();
+
+        assert_eq!(value, 1);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn incomplete_probe_reports_causal_detail_before_mutation() {
+        let mut p = probe();
+        p.blocking_reasons = vec![BlockingReason::ProbeIncomplete {
+            component: "Windows storage inventory".into(),
+            detail: "timed out twice".into(),
+        }];
+
+        let error = require_complete(&p).unwrap_err().to_string();
+        assert!(error.contains("Windows storage inventory"), "{error}");
+        assert!(error.contains("timed out twice"), "{error}");
+        assert!(error.contains("No disk changes were made"), "{error}");
     }
 }

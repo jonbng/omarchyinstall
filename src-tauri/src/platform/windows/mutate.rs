@@ -96,19 +96,7 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
 
 pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
     let probe = crate::platform::probe_machine()?;
-    let probed_linux_device = probe
-        .linux_by_id
-        .as_deref()
-        .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
-    // This branch is intentionally a single-machine bridge until the ISO-side
-    // by-id canonicalization is released.  Refuse before touching C: elsewhere.
-    cidata::windows_vm_archinstall_device(probed_linux_device)?;
-    if probe.bitlocker.iter().any(|volume| !volume.fully_decrypted) && !allow_bitlocker {
-        return Err(Error::Message(
-            "BitLocker is still enabled. Turn it off (recommended), or explicitly accept the BitLocker recovery risk before continuing."
-                .into(),
-        ));
-    }
+    probe::require_complete(&probe)?;
     let existing = load_journal()?;
     let has_started = existing
         .as_ref()
@@ -122,6 +110,19 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     }) {
         return Err(Error::Message(
             "machine probe has blocking reasons; refuse to shrink".into(),
+        ));
+    }
+    let probed_linux_device = probe
+        .linux_by_id
+        .as_deref()
+        .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
+    // This branch is intentionally a single-machine bridge until the ISO-side
+    // by-id canonicalization is released.  Refuse before touching C: elsewhere.
+    cidata::windows_vm_archinstall_device(probed_linux_device)?;
+    if probe.bitlocker.iter().any(|volume| !volume.fully_decrypted) && !allow_bitlocker {
+        return Err(Error::Message(
+            "BitLocker is still enabled. Turn it off (recommended), or explicitly accept the BitLocker recovery risk before continuing."
+                .into(),
         ));
     }
     let iso = download::iso_paths()?;
@@ -560,19 +561,17 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
         "FAT32",
         false,
     )?;
+    let current_probe = crate::platform::probe_machine()?;
+    probe::require_complete(&current_probe)?;
     let linux = journal
         .linux_device
         .clone()
-        .or_else(|| {
-            crate::platform::probe_machine()
-                .ok()
-                .and_then(|p| p.linux_by_id)
-        })
+        .or_else(|| current_probe.linux_by_id.clone())
         .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
     let install_device = cidata::windows_vm_archinstall_device(&linux)?;
     let target_disk_number = required_u32(journal.target_disk_number, "target disk number")?;
     let target_disk_id = format!(r"\\.\PHYSICALDRIVE{target_disk_number}");
-    let disk_bytes = crate::platform::probe_machine()?
+    let disk_bytes = current_probe
         .disks
         .iter()
         .find(|d| d.device_id.eq_ignore_ascii_case(&target_disk_id))

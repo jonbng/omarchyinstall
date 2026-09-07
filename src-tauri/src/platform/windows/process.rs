@@ -88,10 +88,10 @@ pub fn output_with_timeout(
             child.wait()?;
             let _ = join_reader(stdout_reader, description, "stdout");
             let _ = join_reader(stderr_reader, description, "stderr");
-            return Err(Error::Message(format!(
-                "{description} timed out after {} seconds",
-                timeout.as_secs()
-            )));
+            return Err(Error::Timeout {
+                description: description.into(),
+                seconds: timeout.as_secs(),
+            });
         }
     };
     Ok(Output {
@@ -136,7 +136,7 @@ pub fn run_storage_powershell(script: &str) -> Result<String> {
 /// Runs the read-only Storage/CIM inventory with a bounded wait. Mutating
 /// storage commands deliberately use `run_storage_powershell` without a
 /// forced timeout so they cannot be killed halfway through a disk operation.
-pub fn run_storage_powershell_read_only(script: &str) -> Result<String> {
+pub fn run_storage_powershell_read_only(script: &str, timeout: Duration) -> Result<String> {
     let output = output_with_timeout(
         system_command(SystemTool::PowerShell)?.args([
             "-NoProfile",
@@ -144,7 +144,7 @@ pub fn run_storage_powershell_read_only(script: &str) -> Result<String> {
             "-Command",
             script,
         ]),
-        Duration::from_secs(30),
+        timeout,
         "Windows storage inventory",
     )?;
     if !output.status.success() {

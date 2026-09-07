@@ -294,7 +294,24 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
         "host_info" => blocking!(platform::host_info()),
         "probe_machine" => {
             let _operation = state.operation.lock().await;
-            blocking!(platform::probe_machine())
+            let started = std::time::SystemTime::now();
+            let started_unix_ms = started
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let timer = std::time::Instant::now();
+            let result = tokio::task::spawn_blocking(platform::probe_machine)
+                .await
+                .map_err(|error| crate::error::Error::Message(error.to_string()))
+                .and_then(|result| result);
+            crate::diagnostics::record_probe_attempt(
+                started_unix_ms,
+                timer.elapsed().as_millis(),
+                &result,
+            );
+            result
+                .map_err(|error| error.to_string())
+                .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
         }
         "load_install_state" => blocking!(platform::load_install_state()),
         "relaunch_elevated" => {
@@ -323,7 +340,10 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
-        "pick_local_iso" => blocking!(platform::pick_local_iso(None)),
+        "pick_local_iso" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::pick_local_iso(None))
+        }
         "prepare_local_iso" => {
             let _operation = state.operation.lock().await;
             let path = args

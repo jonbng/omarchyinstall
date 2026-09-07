@@ -71,6 +71,7 @@ pub enum BlockingReason {
     EfiVarsLocked,
     ProbeIncomplete {
         component: String,
+        detail: String,
     },
     MissingEsp {
         disk_id: String,
@@ -348,5 +349,14 @@ mod tests {
         .unwrap();
         assert!(ram.contains(r#""type":"ram""#), "{ram}");
         assert!(ram.contains("haveInstalled"), "{ram}");
+
+        let incomplete = serde_json::to_value(BlockingReason::ProbeIncomplete {
+            component: "Windows storage inventory".into(),
+            detail: "timed out twice".into(),
+        })
+        .unwrap();
+        assert_eq!(incomplete["type"], "probeIncomplete");
+        assert_eq!(incomplete["component"], "Windows storage inventory");
+        assert_eq!(incomplete["detail"], "timed out twice");
     }
 }

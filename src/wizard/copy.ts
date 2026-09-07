@@ -75,7 +75,7 @@ export function reasonBody(reason: BlockingReason): string {
     case "efiVarsLocked":
       return "Windows refused EFI variable access. Re-run as Administrator. Without this, the one-shot installer boot entry cannot be set.";
     case "probeIncomplete":
-      return `The ${reason.component} check did not complete. No disk changes are allowed until it succeeds.`;
+      return `The ${reason.component} check did not complete. ${reason.detail} No disk changes are allowed until it succeeds.`;
     case "missingEsp":
       return `No EFI system partition was found on the Windows boot disk (${reason.diskId}).`;
     case "ambiguousEsp":

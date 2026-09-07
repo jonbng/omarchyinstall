@@ -20,7 +20,7 @@ export type BlockingReason =
       needTotalPhys: number;
     }
   | { type: "efiVarsLocked" }
-  | { type: "probeIncomplete"; component: string }
+  | { type: "probeIncomplete"; component: string; detail: string }
   | { type: "missingEsp"; diskId: string }
   | { type: "ambiguousEsp"; diskId: string; count: number }
   | { type: "rst"; diskId: string }

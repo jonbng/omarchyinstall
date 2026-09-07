@@ -122,6 +122,7 @@ export default function Wizard() {
   const [probe, setProbe] = useState<MachineProbe | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
   const [probing, setProbing] = useState(true);
+  const [probeStartedAt, setProbeStartedAt] = useState(() => Date.now());
   const [identity, setIdentity] = useState<CidataIdentity>(emptyIdentity);
   const [password2, setPassword2] = useState("");
   const [keyboardLabel, setKeyboardLabel] = useState("English (US)");
@@ -140,11 +141,12 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.8");
+  const [version, setVersion] = useState("0.4.9");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
   async function loadProbe() {
+    setProbeStartedAt(Date.now());
     setProbing(true);
     setProbeError(null);
     try {
@@ -539,6 +541,7 @@ export default function Wizard() {
             <Welcome
               media={iso.state}
               mediaRunning={iso.running}
+              systemCheckRunning={probing}
               onChooseLocal={() => void chooseLocalIso()}
               onUseOfficial={chooseOfficialIso}
               onRetry={() => void iso.start()}
@@ -548,6 +551,7 @@ export default function Wizard() {
             <ProbeStep
               probe={probe}
               probing={probing}
+              probeStartedAt={probeStartedAt}
               error={probeError}
               actionError={actionError}
               busy={busy}
@@ -757,12 +761,14 @@ function IsoStatusStrip({
 function Welcome({
   media,
   mediaRunning,
+  systemCheckRunning,
   onChooseLocal,
   onUseOfficial,
   onRetry,
 }: {
   media: IsoAcquisitionState;
   mediaRunning: boolean;
+  systemCheckRunning: boolean;
   onChooseLocal: () => void;
   onUseOfficial: () => void;
   onRetry: () => void;
@@ -805,7 +811,11 @@ function Welcome({
             disabled={mediaRunning || media.phase === "selecting"}
             onClick={onChooseLocal}
           >
-            {media.phase === "selecting" ? "Selecting…" : "Choose local ISO"}
+            {media.phase === "selecting"
+              ? systemCheckRunning
+                ? "Waiting for system check…"
+                : "Selecting…"
+              : "Choose local ISO"}
           </button>
           {media.phase === "error" && (
             <button type="button" className="btn primary compact" onClick={onRetry}>
@@ -955,6 +965,7 @@ function flagLabel(state: CheckRow["state"]): string {
 function ProbeStep({
   probe,
   probing,
+  probeStartedAt,
   error,
   actionError,
   busy,
@@ -966,6 +977,7 @@ function ProbeStep({
 }: {
   probe: MachineProbe | null;
   probing: boolean;
+  probeStartedAt: number;
   error: string | null;
   actionError: string | null;
   busy: boolean;
@@ -978,6 +990,17 @@ function ProbeStep({
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [diagnosticPath, setDiagnosticPath] = useState<string | null>(null);
   const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!probing) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [probing, probeStartedAt]);
+
+  const probeElapsed = Math.max(0, Math.floor((now - probeStartedAt) / 1_000));
+  const probeAttempt = probeElapsed < 45 ? 1 : 2;
 
   async function exportDiagnostics() {
     setDiagnosticBusy(true);
@@ -997,7 +1020,7 @@ function ProbeStep({
     return (
       <p className="probe-wait">
         <span className="cursor" />
-        reading firmware, disks, bitlocker, ram
+        checking Windows storage · attempt {probeAttempt} of 2 · {probeElapsed}s
       </p>
     );
   }
@@ -1038,6 +1061,12 @@ function ProbeStep({
 
   return (
     <div className="probe">
+      {probing && (
+        <p className="probe-wait probe-retrying" role="status">
+          <span className="cursor" />
+          checking Windows storage · attempt {probeAttempt} of 2 · {probeElapsed}s
+        </p>
+      )}
       <div className={`system-result ${ready ? "ready" : "blocked"}`}>
         <span className="result-icon">{ready ? "✓" : "!"}</span>
         <div>
@@ -1118,14 +1147,19 @@ function ProbeStep({
             <strong>Still failing intermittently?</strong>
             <p>Export a ZIP with recent check attempts, hardware results, and installer logs.</p>
           </div>
-          <button
-            type="button"
-            className="btn ghost"
-            disabled={diagnosticBusy}
-            onClick={() => void exportDiagnostics()}
-          >
-            {diagnosticBusy ? "Collecting…" : "Export diagnostic report"}
-          </button>
+          <div className="diagnostic-actions">
+            <button type="button" className="btn primary" disabled={probing} onClick={onRetry}>
+              {probing ? "Checking…" : "Run check again"}
+            </button>
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={diagnosticBusy || probing}
+              onClick={() => void exportDiagnostics()}
+            >
+              {diagnosticBusy ? "Collecting…" : "Export diagnostic report"}
+            </button>
+          </div>
         </div>
       )}
       {diagnosticPath && <p className="note mono">Saved to {diagnosticPath}</p>}
