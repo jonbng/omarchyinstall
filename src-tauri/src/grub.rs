@@ -221,7 +221,8 @@ set default=0
 set timeout=0
 
 menuentry "Omarchy Installer (Windows QEMU workaround)" --id 'archlinux' {{
-    chainloader (${{kernel_part}})/{VM_KERNEL_FAT_PATH} \
+    set root=${{kernel_part}}
+    chainloader /{VM_KERNEL_FAT_PATH} \
         initrd=\\EFI\\OmarchyInstall\\initramfs-linux-t2.img \
         archisobasedir=arch \
         img_dev=PARTUUID={guid} \
@@ -262,8 +263,9 @@ mod tests {
             "{cfg}"
         );
         assert!(!cfg.contains("set kernel_part=hd0,"), "{cfg}");
+        assert!(cfg.contains("set root=${kernel_part}"), "{cfg}");
         assert!(
-            cfg.contains("chainloader (${kernel_part})/EFI/OmarchyInstall/vmlinuz-linux-t2"),
+            cfg.contains("chainloader /EFI/OmarchyInstall/vmlinuz-linux-t2"),
             "{cfg}"
         );
         assert!(
