@@ -19,7 +19,7 @@ mod winvol;
 pub fn run_storage_helper_if_requested() -> bool {
     #[cfg(windows)]
     {
-        return platform::windows::native_storage::run_helper_if_requested();
+        return platform::windows::run_storage_helper_if_requested();
     }
     #[cfg(not(windows))]
     false

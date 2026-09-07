@@ -141,7 +141,7 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.13");
+  const [version, setVersion] = useState("0.4.14");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 

@@ -39,6 +39,10 @@ pub fn probe_machine() -> Result<MachineProbe> {
     probe::probe_machine()
 }
 
+pub(crate) fn run_storage_helper_if_requested() -> bool {
+    native_storage::run_helper_if_requested()
+}
+
 pub fn relaunch_elevated() -> Result<()> {
     elevation::relaunch_elevated()
 }
