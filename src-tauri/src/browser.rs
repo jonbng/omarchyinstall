@@ -323,7 +323,6 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             blocking!(platform::reboot_to_firmware())
         }
         "download_iso" => {
-            let _operation = state.operation.lock().await;
             let tx = state.events.clone();
             if download::stub_skips_iso() {
                 download::skip_iso_download(move |progress| {
@@ -340,10 +339,7 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
-        "pick_local_iso" => {
-            let _operation = state.operation.lock().await;
-            blocking!(platform::pick_local_iso(None))
-        }
+        "pick_local_iso" => blocking!(platform::pick_local_iso(None)),
         "prepare_local_iso" => {
             let _operation = state.operation.lock().await;
             let path = args

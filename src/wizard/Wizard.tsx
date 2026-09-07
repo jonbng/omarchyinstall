@@ -141,7 +141,7 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.11");
+  const [version, setVersion] = useState("0.4.12");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
@@ -223,7 +223,7 @@ export default function Wizard() {
     KEYBOARDS.some((keyboard) => keyboard.id === identity.keyboard && keyboard.label === keyboardLabel) &&
     TIMEZONES.includes(identity.timezone);
   const eraseOk = eraseInput.trim() === ERASE_PHRASE;
-  const isoReady = iso.state.phase === "ready" && iso.state.result != null;
+  const isoReady = iso.state.phase === "ready";
 
   const index = STEPS.indexOf(step);
   const currentQuestion = SETUP_QUESTIONS[setupQuestion];
@@ -382,7 +382,7 @@ export default function Wizard() {
           ? "Retry & continue"
           : "Begin installation"
       : step === "Review"
-        ? isoReady ? "Erase Windows & prepare Omarchy" : "Waiting for verification…"
+        ? isoReady ? "Verify ISO & prepare Omarchy" : "Waiting for installation media…"
         : step === "Setup" && setupQuestion === SETUP_QUESTIONS.length - 1
           ? "Review installation"
           : "Next";
@@ -541,7 +541,6 @@ export default function Wizard() {
             <Welcome
               media={iso.state}
               mediaRunning={iso.running}
-              systemCheckRunning={probing}
               onChooseLocal={() => void chooseLocalIso()}
               onUseOfficial={chooseOfficialIso}
               onRetry={() => void iso.start()}
@@ -594,7 +593,6 @@ export default function Wizard() {
               native={native}
               identity={identity}
               journal={journal}
-              expectedIso={iso.state.result}
               allowBitlocker={bitlockerActive && bitlockerRiskAccepted}
               abortRequested={abortRequested}
               onStatus={(next) => {
@@ -682,19 +680,15 @@ function isoSourceName(source: IsoSource): string {
 function isoStatusLabel(state: IsoAcquisitionState): string {
   switch (state.phase) {
     case "idle":
-      return state.source.kind === "official" ? "Ready to download" : "Ready to verify";
+      return state.source.kind === "official" ? "Ready to download" : "Ready to prepare";
     case "selecting":
       return "Selecting an ISO…";
     case "preparing-local":
       return "Preparing selected ISO";
     case "download":
       return "Downloading official Omarchy ISO";
-    case "hash":
-      return "Checking the downloaded file";
-    case "signature":
-      return "Checking the publisher signature";
     case "ready":
-      return "Installation media verified";
+      return "Installation media ready";
     case "error":
       return "Installation media needs attention";
   }
@@ -742,8 +736,8 @@ function IsoStatusStrip({
             {isoSourceName(state.source)}
             {isoAcquisitionRunning(state.phase) && state.total != null
               ? ` · ${formatBytes(state.bytes)} of ${formatBytes(state.total)}${pct != null ? ` · ${pct}%` : ""}`
-              : state.phase === "ready" && state.result
-                ? ` · ${formatBytes(state.result.bytes)}`
+              : state.phase === "ready" && state.total
+                ? ` · ${formatBytes(state.total)}`
                 : ""}
           </span>
           <IsoProgressBar state={state} />
@@ -761,14 +755,12 @@ function IsoStatusStrip({
 function Welcome({
   media,
   mediaRunning,
-  systemCheckRunning,
   onChooseLocal,
   onUseOfficial,
   onRetry,
 }: {
   media: IsoAcquisitionState;
   mediaRunning: boolean;
-  systemCheckRunning: boolean;
   onChooseLocal: () => void;
   onUseOfficial: () => void;
   onRetry: () => void;
@@ -793,7 +785,7 @@ function Welcome({
             {media.phase === "idle"
               ? media.source.kind === "official"
                 ? "The roughly 6 GiB download starts when you begin."
-                : "This file will be checked when you begin."
+                : "This file will be prepared now and verified before disk changes."
               : isoStatusLabel(media)}
           </small>
           {media.error && <small className="media-error">{media.error}</small>}
@@ -811,11 +803,7 @@ function Welcome({
             disabled={mediaRunning || media.phase === "selecting"}
             onClick={onChooseLocal}
           >
-            {media.phase === "selecting"
-              ? systemCheckRunning
-                ? "Waiting for system check…"
-                : "Selecting…"
-              : "Choose local ISO"}
+            {media.phase === "selecting" ? "Selecting…" : "Choose local ISO"}
           </button>
           {media.phase === "error" && (
             <button type="button" className="btn primary compact" onClick={onRetry}>
@@ -844,7 +832,7 @@ function MediaWaitStep({
       <p className="review-lead">
         {failed
           ? "Fix or retry the media step before reviewing the disk erase. Your Windows installation has not been changed."
-          : "Your setup is saved. The erase confirmation will appear after the ISO has downloaded and passed both integrity checks."}
+          : "Your setup is saved. The erase confirmation will appear after the ISO has been downloaded or prepared."}
       </p>
       <div className={`media-wait-card ${failed ? "error" : ""}`}>
         <strong>{isoStatusLabel(state)}</strong>
@@ -1464,7 +1452,7 @@ function ConfirmStep({
         <dd>{keyboardLabel}</dd>
         <dt>Install media</dt>
         <dd>
-          {isoSourceName(media.source)} · <span className="verified-copy">verified</span>
+          {isoSourceName(media.source)} · <span>verification runs before disk changes</span>
         </dd>
         <dt>Git</dt>
         <dd>
@@ -1479,11 +1467,8 @@ function ConfirmStep({
           <span className={media.source.kind === "local" ? "mono" : undefined}>
             {media.source.kind === "local" ? media.source.path : isoSourceName(media.source)}
           </span>
-          <span className="verified-copy">
-            {media.result ? `${formatBytes(media.result.bytes)} · SHA-256 verified · signed` : "Verified"}
-          </span>
+          <span>{media.total ? `${formatBytes(media.total)} · verification deferred` : "Verification deferred"}</span>
         </div>
-        {media.result && <p className="mono media-digest">{media.result.sha256}</p>}
         {disk && <DiskCard disk={disk} linuxById={probe?.linuxById ?? null} />}
       </details>
 
@@ -1551,7 +1536,6 @@ function MutateStep({
   native,
   identity,
   journal,
-  expectedIso,
   allowBitlocker,
   abortRequested,
   onStatus,
@@ -1563,7 +1547,6 @@ function MutateStep({
   native: boolean;
   identity: CidataIdentity;
   journal: StateJournal | null;
-  expectedIso: VerifyResult | null;
   allowBitlocker: boolean;
   abortRequested: { current: boolean };
   onStatus: (next: { phase: string; ready: boolean; rebooting: boolean }) => void;
@@ -1592,8 +1575,6 @@ function MutateStep({
   onJournalRef.current = onJournal;
   const onClearPasswordRef = useRef(onClearPassword);
   onClearPasswordRef.current = onClearPassword;
-  const expectedIsoRef = useRef(expectedIso);
-  expectedIsoRef.current = expectedIso;
   const onMediaInvalidRef = useRef(onMediaInvalid);
   onMediaInvalidRef.current = onMediaInvalid;
 
@@ -1637,15 +1618,8 @@ function MutateStep({
         if (start === "prepare") {
           checkingMedia = true;
           setPhase("verify");
-          const expected = expectedIsoRef.current;
-          if (!expected) {
-            throw new Error("The installation media is no longer approved. Verify it again before continuing.");
-          }
           const result = await invoke<VerifyResult>("verify_iso");
           if (cancelled || abortRequested.current) return;
-          if (result.sha256 !== expected.sha256 || result.bytes !== expected.bytes) {
-            throw new Error("The installation media changed after review. Verify it again before continuing.");
-          }
           checkingMedia = false;
           setSha(result.sha256);
           setBytes(result.bytes);
@@ -1689,7 +1663,7 @@ function MutateStep({
       cancelled = true;
       unlisten?.();
     };
-    // The approved media and identity are read through refs; retry is `tick`.
+    // Identity is read through a ref; retry is `tick`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, allowBitlocker]);
 
@@ -1701,7 +1675,7 @@ function MutateStep({
       : null;
   const label =
     phase === "verify"
-      ? "Rechecking installation media"
+      ? "Verifying installation media"
       : phase === "prepare"
             ? "Creating installer partitions"
             : phase === "stage"

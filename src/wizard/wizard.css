@@ -185,7 +185,6 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .review-details { margin-bottom: 1rem; }
 .iso-source { display: flex; justify-content: space-between; align-items: center; gap: 1rem; min-width: 0; padding: .6rem 0; }
 .iso-source > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .74rem; }
-.verified-copy { color: var(--green); }
 .media-digest { margin: 0 0 .8rem; color: var(--muted); }
 .danger-zone { margin-top: 1rem; padding: 1rem; border: 1px solid rgb(var(--rgb-red) / .38); background: rgb(var(--rgb-red) / .06); }
 .danger-zone > strong { color: var(--red); font-size: .84rem; }

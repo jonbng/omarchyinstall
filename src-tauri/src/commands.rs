@@ -77,11 +77,7 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
 }
 
 #[tauri::command]
-pub async fn download_iso(
-    app: tauri::AppHandle,
-    operation: State<'_, OperationGate>,
-) -> Result<()> {
-    let _operation = operation.lock().await;
+pub async fn download_iso(app: tauri::AppHandle) -> Result<()> {
     let started = std::time::Instant::now();
     log::info!("ISO download started");
     let emit = |progress| {
@@ -106,11 +102,7 @@ pub async fn download_iso(
 }
 
 #[tauri::command]
-pub async fn pick_local_iso(
-    window: tauri::WebviewWindow,
-    operation: State<'_, OperationGate>,
-) -> Result<Option<std::path::PathBuf>> {
-    let _operation = operation.lock().await;
+pub async fn pick_local_iso(window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>> {
     #[cfg(windows)]
     let owner = Some(
         window
