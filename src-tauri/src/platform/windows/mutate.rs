@@ -417,10 +417,6 @@ pub fn stage_bootloader() -> Result<StageResult> {
         false,
     )?;
     let cidata_root = volume_root(cidata_guid)?;
-    let cidata_partition_number = staging_partition_number(
-        &journal,
-        required(&journal.cidata_partuuid, "cidata PARTUUID")?,
-    )?;
     copy_vm_boot_file(
         mounted_iso.root(),
         VM_KERNEL_ISO_PATH,
@@ -445,7 +441,7 @@ pub fn stage_bootloader() -> Result<StageResult> {
                 "OMARCHYINST PARTUUID missing; Get-Partition.Guid was not journaled".into(),
             )
         })?;
-    let cfg = emit_windows_vm_grub_cfg(&partuuid, cidata_partition_number, iso_size);
+    let cfg = emit_windows_vm_grub_cfg(&partuuid, iso_size);
     let cfg_path = PathBuf::from(format!("{}{}", esp_root, ESP_GRUB_CFG.replace('/', "\\")));
     if let Some(parent) = cfg_path.parent() {
         fs::create_dir_all(parent)?;
@@ -487,17 +483,6 @@ fn copy_vm_boot_file(
         )));
     }
     Ok(())
-}
-
-fn staging_partition_number(journal: &StateJournal, part_guid: &str) -> Result<u32> {
-    let disk_number = required_u32(journal.target_disk_number, "target disk number")?;
-    let raw = run_storage_powershell(&format!(
-        r#"$ErrorActionPreference='Stop'; $p=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{part_guid}' }}; if (-not $p) {{ throw 'journaled staging partition disappeared' }}; [string]$p.PartitionNumber"#,
-        part_guid = ps_guid(part_guid),
-    ))?;
-    raw.trim()
-        .parse()
-        .map_err(|_| Error::Message(format!("invalid staging partition number: {raw}")))
 }
 
 fn collect_relative_files(root: &std::path::Path) -> Result<Vec<String>> {

@@ -205,12 +205,9 @@ menuentry "Omarchy Installer" --id 'archlinux' {{
 /// QEMU/OVMF workaround for the measured Windows VM.  Its copied GRUB can
 /// chainload EFI applications but its `linux` loader fails before initramfs is
 /// loaded.  The Linux EFI stub loads the initramfs from the same FAT volume.
-/// `hd0` is intentionally fixture-specific and must not be generalized.
-pub fn emit_windows_vm_grub_cfg(
-    partuuid: &str,
-    cidata_partition_number: u32,
-    iso_bytes: u64,
-) -> String {
+/// Discover the FAT volume by its staged kernel path because Windows partition
+/// numbers do not necessarily match GRUB's GPT slot numbers.
+pub fn emit_windows_vm_grub_cfg(partuuid: &str, iso_bytes: u64) -> String {
     let size = copytoram_size_spec(iso_bytes);
     let guid = partuuid.trim().trim_matches(|c| c == '{' || c == '}');
     format!(
@@ -218,11 +215,12 @@ pub fn emit_windows_vm_grub_cfg(
 insmod fat
 insmod chain
 
+search --no-floppy --file --set=kernel_part /{VM_KERNEL_FAT_PATH}
+
 set default=0
 set timeout=0
 
 menuentry "Omarchy Installer (Windows QEMU workaround)" --id 'archlinux' {{
-    set kernel_part=hd0,gpt{cidata_partition_number}
     chainloader (${{kernel_part}})/{VM_KERNEL_FAT_PATH} \
         initrd=\\EFI\\OmarchyInstall\\initramfs-linux-t2.img \
         archisobasedir=arch \
@@ -256,8 +254,14 @@ mod tests {
     #[test]
     fn windows_vm_grub_chainloads_the_kernel_efi_stub() {
         let guid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let cfg = emit_windows_vm_grub_cfg(guid, 5, 6 * 1024 * 1024 * 1024);
-        assert!(cfg.contains("set kernel_part=hd0,gpt5"), "{cfg}");
+        let cfg = emit_windows_vm_grub_cfg(guid, 6 * 1024 * 1024 * 1024);
+        assert!(
+            cfg.contains(
+                "search --no-floppy --file --set=kernel_part /EFI/OmarchyInstall/vmlinuz-linux-t2"
+            ),
+            "{cfg}"
+        );
+        assert!(!cfg.contains("set kernel_part=hd0,"), "{cfg}");
         assert!(
             cfg.contains("chainloader (${kernel_part})/EFI/OmarchyInstall/vmlinuz-linux-t2"),
             "{cfg}"
