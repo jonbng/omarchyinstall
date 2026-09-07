@@ -48,7 +48,15 @@ pub fn host_info() -> Result<HostInfo> {
 #[tauri::command]
 pub async fn probe_machine(operation: State<'_, OperationGate>) -> Result<MachineProbe> {
     let _operation = operation.lock().await;
-    run_blocking("machine probe", platform::probe_machine).await
+    let started = std::time::SystemTime::now();
+    let started_unix_ms = started
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let timer = std::time::Instant::now();
+    let result = run_blocking("machine probe", platform::probe_machine).await;
+    crate::diagnostics::record_probe_attempt(started_unix_ms, timer.elapsed().as_millis(), &result);
+    result
 }
 
 #[tauri::command]

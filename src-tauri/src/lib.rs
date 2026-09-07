@@ -1,6 +1,7 @@
 mod browser;
 mod cidata;
 mod commands;
+mod diagnostics;
 mod download;
 mod error;
 mod grub;

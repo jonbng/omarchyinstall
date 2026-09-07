@@ -326,6 +326,12 @@ pub fn export_support_bundle() -> Result<PathBuf> {
                 .as_slice(),
         )?;
     }
+    let probe_history = dir.join(crate::diagnostics::PROBE_HISTORY_FILE);
+    if probe_history.is_file() {
+        zip.start_file(crate::diagnostics::PROBE_HISTORY_FILE, opts)
+            .map_err(|e| Error::Message(format!("zip: {e}")))?;
+        zip.write_all(&fs::read(probe_history)?)?;
+    }
     zip.finish()
         .map_err(|e| Error::Message(format!("zip: {e}")))?;
     Ok(zip_path)

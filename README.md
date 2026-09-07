@@ -58,6 +58,9 @@ Releases are currently unsigned, so Windows SmartScreen may display a warning. I
 Choosing **Undo and exit** after staging attempts to remove the temporary partitions, boot entry, and EFI files and expand Windows again. This rollback is only available before rebooting into the live installer. A separate backup remains essential.
 
 Runtime logs, the downloaded ISO, and rollback state are stored in `%LOCALAPPDATA%\OmarchyInstall`.
+If the machine check fails, **Export diagnostic report** creates a support ZIP there and opens it
+in Explorer. The ZIP includes the last 20 probe attempts so intermittent failures remain visible;
+it can contain hardware and partition identifiers, but not passwords.
 
 ## Development
 

@@ -140,7 +140,7 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.7");
+  const [version, setVersion] = useState("0.4.8");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
@@ -975,6 +975,24 @@ function ProbeStep({
   bitlockerRiskAccepted: boolean;
   onBitlockerRiskAccepted: (accepted: boolean) => void;
 }) {
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
+  const [diagnosticPath, setDiagnosticPath] = useState<string | null>(null);
+  const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
+
+  async function exportDiagnostics() {
+    setDiagnosticBusy(true);
+    setDiagnosticError(null);
+    try {
+      const path = await invoke<string>("export_support_bundle");
+      setDiagnosticPath(path);
+      await revealItemInDir(path).catch(() => undefined);
+    } catch (err: unknown) {
+      setDiagnosticError(invokeError(err));
+    } finally {
+      setDiagnosticBusy(false);
+    }
+  }
+
   if (probing && !probe) {
     return (
       <p className="probe-wait">
@@ -988,9 +1006,21 @@ function ProbeStep({
       <div className="copy">
         <p className="kicker">probe</p>
         <p className="banner error">{error}</p>
-        <button type="button" className="btn primary" onClick={onRetry}>
-          Retry
-        </button>
+        <div className="actions">
+          <button type="button" className="btn primary" onClick={onRetry}>
+            Retry
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={diagnosticBusy}
+            onClick={() => void exportDiagnostics()}
+          >
+            {diagnosticBusy ? "Collecting…" : "Export diagnostic report"}
+          </button>
+        </div>
+        {diagnosticPath && <p className="note mono">Saved to {diagnosticPath}</p>}
+        {diagnosticError && <p className="banner error">{diagnosticError}</p>}
       </div>
     );
   }
@@ -1081,6 +1111,25 @@ function ProbeStep({
       })}
 
       {actionError && <p className="banner error">{actionError}</p>}
+
+      {!ready && (
+        <div className="diagnostic-report">
+          <div>
+            <strong>Still failing intermittently?</strong>
+            <p>Export a ZIP with recent check attempts, hardware results, and installer logs.</p>
+          </div>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={diagnosticBusy}
+            onClick={() => void exportDiagnostics()}
+          >
+            {diagnosticBusy ? "Collecting…" : "Export diagnostic report"}
+          </button>
+        </div>
+      )}
+      {diagnosticPath && <p className="note mono">Saved to {diagnosticPath}</p>}
+      {diagnosticError && <p className="banner error">{diagnosticError}</p>}
 
       <details className="optional technical-details">
         <summary>Technical details</summary>

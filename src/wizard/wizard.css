@@ -98,6 +98,9 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .blocker.warning h3 { color: var(--yellow); }
 .blocker p { margin: 0; color: rgb(var(--rgb-white) / .7); font-size: .76rem; line-height: 1.5; }
 .risk-acceptance { margin-top: .7rem; color: var(--yellow); }
+.diagnostic-report { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: .9rem; padding: .9rem 1rem; border: 1px solid var(--line); background: rgb(var(--rgb-storm) / .32); }
+.diagnostic-report strong { font-size: .78rem; }
+.diagnostic-report p { margin: .25rem 0 0; color: var(--muted); font-size: .72rem; line-height: 1.45; text-wrap: pretty; }
 .optional { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: .9rem; }
 .optional summary { min-height: 2.2rem; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-size: .75rem; list-style: none; }
 .optional summary::-webkit-details-marker { display: none; }
@@ -219,7 +222,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .wizard-foot { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0 1.35rem; border-top: 1px solid rgb(var(--rgb-term-black) / .55); background: rgb(var(--rgb-night) / .94); }
 .hint { color: var(--muted); font-size: .68rem; }
 .btn { appearance: none; min-width: 6.5rem; min-height: 2.7rem; padding: 0 1rem; border: 1px solid transparent; display: inline-flex; justify-content: center; align-items: center; gap: .5rem; color: var(--fg); font: inherit; font-size: .74rem; font-weight: 600; cursor: pointer; transition: background 160ms var(--ease-out), color 160ms var(--ease-out), border-color 160ms var(--ease-out), transform 140ms var(--ease-out), opacity 160ms var(--ease-out); }
-.btn:active:not(:disabled) { transform: scale(.97); }
+.btn:active:not(:disabled) { transform: scale(.96); }
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 .btn.primary { background: var(--green); color: var(--bg); }
 .btn.danger { min-width: 15rem; background: var(--red); color: var(--bg); }

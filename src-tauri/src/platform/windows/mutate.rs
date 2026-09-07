@@ -570,12 +570,19 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
         })
         .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
     let install_device = cidata::windows_vm_archinstall_device(&linux)?;
+    let target_disk_number = required_u32(journal.target_disk_number, "target disk number")?;
+    let target_disk_id = format!(r"\\.\PHYSICALDRIVE{target_disk_number}");
     let disk_bytes = crate::platform::probe_machine()?
         .disks
         .iter()
-        .find(|d| d.is_boot)
+        .find(|d| d.device_id.eq_ignore_ascii_case(&target_disk_id))
         .map(|d| d.size_bytes)
-        .unwrap_or(512 * probe::GIB);
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "cannot resolve the journaled target disk size for {target_disk_id}"
+            ))
+        })?;
     let encrypt = identity.encrypt;
     let files = cidata::build_cidata_files(&identity, install_device, disk_bytes)?;
     identity.password.clear();
@@ -863,6 +870,17 @@ pub fn export_support_bundle() -> Result<PathBuf> {
         Err(error) => {
             manifest.push_str("probe: failed\n");
             capture_errors.push(format!("machine probe: {error}"));
+        }
+    }
+
+    let probe_history = dir.join(crate::diagnostics::PROBE_HISTORY_FILE);
+    if probe_history.is_file() {
+        match fs::read(&probe_history) {
+            Ok(body) => {
+                zip.start_file(crate::diagnostics::PROBE_HISTORY_FILE, opts)?;
+                zip.write_all(&body)?;
+            }
+            Err(error) => capture_errors.push(format!("probe history: {error}")),
         }
     }
 

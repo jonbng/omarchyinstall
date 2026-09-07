@@ -296,7 +296,12 @@ pub fn build_cidata_files(
     let boot_size = 2 * GIB;
     let main_start = boot_start + boot_size;
     let gpt_backup = MIB;
-    let main_size = disk_bytes.saturating_sub(main_start + gpt_backup);
+    // Match the ISO configurator: round the usable disk size down to a whole
+    // MiB, then leave the final MiB clear for the backup GPT structures.
+    let aligned_disk_bytes = disk_bytes / MIB * MIB;
+    let main_size = aligned_disk_bytes
+        .checked_sub(main_start + gpt_backup)
+        .ok_or_else(|| Error::Message("target disk is too small for the Omarchy layout".into()))?;
 
     let mut config = json!({
         "app_config": null,
@@ -508,6 +513,18 @@ mod tests {
             cfg["disk_config"]["device_modifications"][0]["device"],
             "/dev/sda"
         );
+    }
+
+    #[test]
+    fn full_disk_layout_rounds_down_and_reserves_backup_gpt_space() {
+        let disk_bytes = 64 * GIB + 123_456;
+        let files =
+            build_cidata_files(&ident(), WINDOWS_VM_ARCHINSTALL_DEVICE, disk_bytes).unwrap();
+        let cfg: Value = serde_json::from_str(&files.user_configuration).unwrap();
+        let partitions = &cfg["disk_config"]["device_modifications"][0]["partitions"];
+        let root_start = partitions[1]["start"]["value"].as_u64().unwrap();
+        let root_size = partitions[1]["size"]["value"].as_u64().unwrap();
+        assert_eq!(root_start + root_size + MIB, 64 * GIB);
     }
 
     #[test]
