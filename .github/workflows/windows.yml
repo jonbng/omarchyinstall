@@ -37,12 +37,13 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          shared-key: windows-x64
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
       - name: Rust tests
-        run: bun run check:rust
+        run: bun run check:rust:release
 
       - name: Build portable executable
         run: bun run tauri:build

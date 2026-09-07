@@ -19,8 +19,9 @@ use windows::{
                 ATTACH_VIRTUAL_DISK_PARAMETERS, ATTACH_VIRTUAL_DISK_VERSION_1,
                 DETACH_VIRTUAL_DISK_FLAG_NONE, OPEN_VIRTUAL_DISK_FLAG_NONE,
                 OPEN_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_VERSION_1,
-                VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_STORAGE_TYPE,
-                VIRTUAL_STORAGE_TYPE_DEVICE_ISO, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+                VIRTUAL_DISK_ACCESS_ATTACH_RO, VIRTUAL_DISK_ACCESS_GET_INFO,
+                VIRTUAL_DISK_ACCESS_MASK, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_ISO,
+                VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
             },
         },
         System::{
@@ -52,7 +53,7 @@ impl MountedIso {
             OpenVirtualDisk(
                 &storage_type,
                 PCWSTR(wide.as_ptr()),
-                VIRTUAL_DISK_ACCESS_ATTACH_RO,
+                iso_open_access(),
                 OPEN_VIRTUAL_DISK_FLAG_NONE,
                 Some(&open_parameters),
                 &mut handle,
@@ -144,7 +145,12 @@ fn wait_for_volume(virtual_disk: HANDLE) -> Result<PathBuf> {
 fn virtual_disk_physical_path(handle: HANDLE) -> Result<PathBuf> {
     let mut buffer = vec![0u16; 32_768];
     let mut bytes = (buffer.len() * std::mem::size_of::<u16>()) as u32;
-    unsafe { GetVirtualDiskPhysicalPath(handle, &mut bytes, PWSTR(buffer.as_mut_ptr())).ok()? };
+    unsafe { GetVirtualDiskPhysicalPath(handle, &mut bytes, PWSTR(buffer.as_mut_ptr())).ok() }
+        .map_err(|error| {
+            Error::Message(format!(
+                "GetVirtualDiskPhysicalPath failed for the attached ISO: {error}"
+            ))
+        })?;
     let len = buffer
         .iter()
         .position(|unit| *unit == 0)
@@ -235,6 +241,10 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+fn iso_open_access() -> VIRTUAL_DISK_ACCESS_MASK {
+    VIRTUAL_DISK_ACCESS_ATTACH_RO | VIRTUAL_DISK_ACCESS_GET_INFO
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +261,13 @@ mod tests {
             ..disk
         };
         assert!(same_device(disk, volume));
+    }
+
+    #[test]
+    fn iso_open_access_supports_attach_and_physical_path_lookup() {
+        let access = iso_open_access();
+        assert!(access.contains(VIRTUAL_DISK_ACCESS_ATTACH_RO));
+        assert!(access.contains(VIRTUAL_DISK_ACCESS_GET_INFO));
+        assert!(!access.contains(windows::Win32::Storage::Vhd::VIRTUAL_DISK_ACCESS_ATTACH_RW));
     }
 }

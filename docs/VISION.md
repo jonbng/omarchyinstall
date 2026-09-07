@@ -1280,7 +1280,13 @@ v1 logging:
 - NVRAM: Boot#### created, `BootNext` value, whether we appended BootOrder; dump full firmware enum in the log / support zip, not in the UI.
 - Rollback journal writes.
 
-Support bundle (`export_support_bundle`): zip of logs + redacted `state.json` + `probe_machine` JSON + `bcdedit /enum firmware` + BitLocker status. Open containing folder via existing `opener` plugin. No telemetry.
+Support bundle (`export_support_bundle`): zip of timestamped operation logs, a redacted
+`state.json`, `probe_machine` JSON, a capture manifest, live disk/partition/volume and mounted-image
+inventory, expected staging-file metadata, relevant storage/application events, firmware state,
+power capabilities, and BitLocker status. Every collector leaves either its output or an explicit
+error instead of failing silently. The bundle can contain hardware identifiers and local paths,
+but never passwords or staged-file contents. Open its containing folder via the existing `opener`
+plugin. No telemetry.
 
 ---
 

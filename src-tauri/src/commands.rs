@@ -13,9 +13,22 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(work)
-        .await
-        .map_err(|error| crate::error::Error::Message(format!("{name} task failed: {error}")))?
+    let started = std::time::Instant::now();
+    log::info!("{name} started");
+    let result = match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(error) => Err(crate::error::Error::Message(format!(
+            "{name} task failed: {error}"
+        ))),
+    };
+    match &result {
+        Ok(_) => log::info!("{name} completed in {} ms", started.elapsed().as_millis()),
+        Err(error) => log::error!(
+            "{name} failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -61,15 +74,27 @@ pub async fn download_iso(
     operation: State<'_, OperationGate>,
 ) -> Result<()> {
     let _operation = operation.lock().await;
+    let started = std::time::Instant::now();
+    log::info!("ISO download started");
     let emit = |progress| {
         let _ = app.emit("iso://progress", &progress);
     };
-    if download::stub_skips_iso() {
-        download::skip_iso_download(emit).await?;
+    let result = if download::stub_skips_iso() {
+        download::skip_iso_download(emit).await
     } else {
-        download::download_iso_files(emit).await?;
+        download::download_iso_files(emit).await.map(|_| ())
+    };
+    match &result {
+        Ok(_) => log::info!(
+            "ISO download completed in {} ms",
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::error!(
+            "ISO download failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ),
     }
-    Ok(())
+    result
 }
 
 #[tauri::command]
@@ -95,7 +120,20 @@ pub async fn prepare_local_iso(
     operation: State<'_, OperationGate>,
 ) -> Result<LocalIsoSelection> {
     let _operation = operation.lock().await;
-    download::prepare_local_iso(&path).await
+    let started = std::time::Instant::now();
+    log::info!("local ISO preparation started");
+    let result = download::prepare_local_iso(&path).await;
+    match &result {
+        Ok(_) => log::info!(
+            "local ISO preparation completed in {} ms",
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::error!(
+            "local ISO preparation failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]

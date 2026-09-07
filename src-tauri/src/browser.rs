@@ -251,14 +251,27 @@ async fn invoke(
         return StatusCode::FORBIDDEN.into_response();
     }
     touch(&state).await;
+    let started = std::time::Instant::now();
+    log::info!("browser command {command} started");
     let work_state = state.clone();
+    let task_command = command.clone();
     let result = tauri::async_runtime::spawn(async move {
         let _active = ActiveGuard::new(work_state.active.clone());
-        run_command(&work_state, &command, args).await
+        run_command(&work_state, &task_command, args).await
     })
     .await
     .map_err(|error| format!("command task failed: {error}"))
     .and_then(|result| result);
+    match &result {
+        Ok(_) => log::info!(
+            "browser command {command} completed in {} ms",
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::error!(
+            "browser command {command} failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ),
+    }
     let body = match result {
         Ok(value) => ApiResponse::Ok { ok: true, value },
         Err(error) => ApiResponse::Err { ok: false, error },

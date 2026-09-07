@@ -59,7 +59,14 @@ pub fn save_atomic(path: &Path, journal: &StateJournal) -> Result<()> {
     file.write_all(serialize_journal(journal)?.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    atomic_replace(&temp, path)
+    atomic_replace(&temp, path)?;
+    log::info!(
+        "journal updated: operation_id={} step={:?} pending_operation={:?}",
+        journal.operation_id,
+        journal.step,
+        journal.pending_operation
+    );
+    Ok(())
 }
 
 #[cfg(windows)]

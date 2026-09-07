@@ -821,22 +821,71 @@ pub fn export_support_bundle() -> Result<PathBuf> {
     let file = fs::File::create(&zip_path)?;
     let mut zip = ZipWriter::new(file);
     let opts = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    if let Ok(Some(j)) = load_journal() {
-        let body = serialize_journal(&j)?;
-        let redacted = journal::redact_journal_json(&body)?;
-        zip.start_file("state.json", opts)?;
-        zip.write_all(redacted.as_bytes())?;
+    let mut manifest = format!(
+        "Omarchy Install support bundle\n\
+         bundle-format: 2\n\
+         app-version: {}\n\
+         build-profile: {}\n\
+         created-unix-ms: {}\n\
+         process-id: {}\n\
+         privacy: contains hardware identifiers, partition identifiers, and local file paths; never passwords or file contents\n",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        std::process::id(),
+    );
+    let mut capture_errors = Vec::new();
+
+    let journal = match load_journal() {
+        Ok(journal) => journal,
+        Err(error) => {
+            manifest.push_str("journal: unreadable\n");
+            capture_errors.push(format!("state.json: {error}"));
+            None
+        }
+    };
+    if let Some(journal) = &journal {
+        manifest.push_str(&format!(
+            "journal: present\noperation-id: {}\nstep: {:?}\npending-operation: {:?}\n",
+            journal.operation_id, journal.step, journal.pending_operation
+        ));
+        match serialize_journal(journal).and_then(|body| journal::redact_journal_json(&body)) {
+            Ok(redacted) => write_bundle_text(&mut zip, "state.json", &redacted, opts)?,
+            Err(error) => capture_errors.push(format!("state.json serialization: {error}")),
+        }
+    } else if !manifest.contains("journal: unreadable") {
+        manifest.push_str("journal: absent\n");
     }
-    if let Ok(probe) = crate::platform::probe_machine() {
-        zip.start_file("probe.json", opts)?;
-        zip.write_all(
-            serde_json::to_vec_pretty(&probe)
-                .unwrap_or_default()
-                .as_slice(),
-        )?;
+
+    match crate::platform::probe_machine() {
+        Ok(probe) => {
+            manifest.push_str(&format!(
+                "probe: ok ({} disks, {} blocking reasons)\n",
+                probe.disks.len(),
+                probe.blocking_reasons.len()
+            ));
+            match serde_json::to_vec_pretty(&probe) {
+                Ok(body) => {
+                    zip.start_file("probe.json", opts)?;
+                    zip.write_all(&body)?;
+                }
+                Err(error) => capture_errors.push(format!("probe.json serialization: {error}")),
+            }
+        }
+        Err(error) => {
+            manifest.push_str("probe: failed\n");
+            capture_errors.push(format!("machine probe: {error}"));
+        }
     }
-    zip.start_file("host.txt", opts)?;
-    zip.write_all(format!("{:?}", host_info()?).as_bytes())?;
+
+    match host_info() {
+        Ok(host) => write_bundle_text(&mut zip, "host.txt", &format!("{host:#?}\n"), opts)?,
+        Err(error) => capture_errors.push(format!("host information: {error}")),
+    }
+
     for (name, tool, args) in [
         (
             "firmware-bcd.txt",
@@ -848,47 +897,206 @@ pub fn export_support_bundle() -> Result<PathBuf> {
             SystemTool::ManageBde,
             vec!["-status"],
         ),
+        ("power-capabilities.txt", SystemTool::PowerCfg, vec!["/a"]),
     ] {
-        zip.start_file(name, opts)?;
-        zip.write_all(diagnostic_output(tool, &args).as_bytes())?;
+        write_diagnostic(&mut zip, name, tool, &args, opts, &mut capture_errors)?;
     }
-    zip.start_file("bitlocker-wmi.json", opts)?;
-    zip.write_all(
-        diagnostic_output(
+
+    for (name, script) in [
+        (
+            "bitlocker-wmi.json",
+            "Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume | Select-Object DeviceID,DriveLetter,ProtectionStatus,ConversionStatus,EncryptionMethod | ConvertTo-Json -Depth 4",
+        ),
+        ("storage.json", STORAGE_DIAGNOSTIC_PS),
+        ("disk-images.json", DISK_IMAGE_DIAGNOSTIC_PS),
+        ("physical-disks.json", PHYSICAL_DISK_DIAGNOSTIC_PS),
+        ("application-files.json", APP_FILE_DIAGNOSTIC_PS),
+        ("staging-files.txt", STAGING_FILE_DIAGNOSTIC_PS),
+        ("relevant-events.txt", EVENT_DIAGNOSTIC_PS),
+    ] {
+        write_diagnostic(
+            &mut zip,
+            name,
             SystemTool::PowerShell,
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume | Select-Object DeviceID,DriveLetter,ProtectionStatus,ConversionStatus | ConvertTo-Json -Depth 4",
-            ],
-        )
-        .as_bytes(),
-    )?;
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            opts,
+            &mut capture_errors,
+        )?;
+    }
+
     let logs = paths::install_logs_dir().unwrap_or_else(|_| dir.join("logs"));
+    let mut log_count = 0usize;
     if logs.is_dir() {
-        if let Ok(rd) = fs::read_dir(&logs) {
-            for ent in rd.flatten() {
-                let p = ent.path();
-                if p.is_file() {
-                    if let Ok(mut f) = fs::File::open(&p) {
-                        zip.start_file(
-                            format!("logs/{}", ent.file_name().to_string_lossy()),
-                            opts,
-                        )?;
-                        let mut buf = Vec::new();
-                        let _ = f.read_to_end(&mut buf);
-                        zip.write_all(&buf)?;
+        match fs::read_dir(&logs) {
+            Ok(rd) => {
+                for entry in rd {
+                    match entry {
+                        Ok(ent) => {
+                            let p = ent.path();
+                            if p.is_file() {
+                                match fs::File::open(&p) {
+                                    Ok(mut file) => {
+                                        let mut buf = Vec::new();
+                                        match file.read_to_end(&mut buf) {
+                                            Ok(_) => {
+                                                zip.start_file(
+                                                    format!(
+                                                        "logs/{}",
+                                                        ent.file_name().to_string_lossy()
+                                                    ),
+                                                    opts,
+                                                )?;
+                                                zip.write_all(&buf)?;
+                                                log_count += 1;
+                                            }
+                                            Err(error) => capture_errors
+                                                .push(format!("read log {}: {error}", p.display())),
+                                        }
+                                    }
+                                    Err(error) => capture_errors
+                                        .push(format!("open log {}: {error}", p.display())),
+                                }
+                            }
+                        }
+                        Err(error) => capture_errors.push(format!("enumerate logs: {error}")),
                     }
                 }
             }
+            Err(error) => capture_errors.push(format!("open logs directory: {error}")),
         }
     }
+    manifest.push_str(&format!("log-files: {log_count}\n"));
+    manifest.push_str(&format!("capture-errors: {}\n", capture_errors.len()));
+    write_bundle_text(&mut zip, "manifest.txt", &manifest, opts)?;
+    write_bundle_text(
+        &mut zip,
+        "capture-errors.txt",
+        if capture_errors.is_empty() {
+            "none\n".to_string()
+        } else {
+            format!("{}\n", capture_errors.join("\n"))
+        }
+        .as_str(),
+        opts,
+    )?;
     zip.finish()?;
     Ok(zip_path)
 }
 
-fn diagnostic_output(tool: SystemTool, args: &[&str]) -> String {
+fn write_bundle_text(
+    zip: &mut ZipWriter<fs::File>,
+    name: &str,
+    body: &str,
+    opts: FileOptions,
+) -> Result<()> {
+    zip.start_file(name, opts)?;
+    zip.write_all(body.as_bytes())?;
+    Ok(())
+}
+
+fn write_diagnostic(
+    zip: &mut ZipWriter<fs::File>,
+    name: &str,
+    tool: SystemTool,
+    args: &[&str],
+    opts: FileOptions,
+    capture_errors: &mut Vec<String>,
+) -> Result<()> {
+    let (body, failed) = diagnostic_output(tool, args);
+    if failed {
+        capture_errors.push(format!("{name}: collector failed; see file for details"));
+    }
+    write_bundle_text(zip, name, &body, opts)
+}
+
+const STORAGE_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+[ordered]@{
+  disks=@(Get-Disk | Select-Object Number,FriendlyName,SerialNumber,UniqueId,BusType,PartitionStyle,OperationalStatus,HealthStatus,IsBoot,IsSystem,IsOffline,IsReadOnly,Size,AllocatedSize,LargestFreeExtent)
+  partitions=@(Get-Partition | Select-Object DiskNumber,PartitionNumber,Guid,GptType,DriveLetter,Offset,Size,AccessPaths,NoDefaultDriveLetter,IsHidden,IsActive,IsBoot,IsSystem)
+  volumes=@(Get-Volume | Select-Object UniqueId,DriveLetter,FileSystemLabel,FileSystemType,DriveType,HealthStatus,OperationalStatus,Size,SizeRemaining,Path)
+} | ConvertTo-Json -Depth 6
+"#;
+
+const DISK_IMAGE_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+@(Get-DiskImage | Select-Object ImagePath,ImageType,Attached,DevicePath,Size,StorageType) | ConvertTo-Json -Depth 4
+"#;
+
+const PHYSICAL_DISK_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+@(Get-CimInstance Win32_DiskDrive | Select-Object Index,Model,SerialNumber,InterfaceType,MediaType,PNPDeviceID,Size,Status) | ConvertTo-Json -Depth 4
+"#;
+
+const APP_FILE_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+$base=Join-Path $env:LOCALAPPDATA 'OmarchyInstall'
+$paths=@(
+  $base,
+  (Join-Path $base 'state.json'),
+  (Join-Path $base 'iso\resolved.json'),
+  (Join-Path $base 'iso\local-source.json')
+)
+if (Test-Path -LiteralPath (Join-Path $base 'iso')) {
+  $paths += @(Get-ChildItem -Force -LiteralPath (Join-Path $base 'iso') | ForEach-Object { $_.FullName })
+}
+if (Test-Path -LiteralPath (Join-Path $base 'iso\local-source.json')) {
+  $local=Get-Content -Raw -LiteralPath (Join-Path $base 'iso\local-source.json') | ConvertFrom-Json
+  if ($local.path) { $paths += [string]$local.path }
+}
+@($paths | Select-Object -Unique | ForEach-Object {
+  if (Test-Path -LiteralPath $_) {
+    Get-Item -Force -LiteralPath $_ | Select-Object FullName,Length,Attributes,CreationTimeUtc,LastWriteTimeUtc
+  } else {
+    [pscustomobject]@{FullName=$_;Missing=$true}
+  }
+}) | ConvertTo-Json -Depth 4
+"#;
+
+const STAGING_FILE_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+$statePath=Join-Path $env:LOCALAPPDATA 'OmarchyInstall\state.json'
+if (-not (Test-Path -LiteralPath $statePath)) { Write-Output 'state.json is absent'; exit 0 }
+$state=Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+function Show-Tree([string]$name,[string]$path) {
+  Write-Output "=== $name ==="
+  Write-Output $path
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { Write-Output 'MISSING'; return }
+  Get-Item -Force -LiteralPath $path | Select-Object FullName,Length,Attributes,CreationTimeUtc,LastWriteTimeUtc | Format-List | Out-String -Width 4096
+  if ((Get-Item -Force -LiteralPath $path).PSIsContainer) {
+    Get-ChildItem -Force -Recurse -LiteralPath $path -ErrorAction SilentlyContinue |
+      Select-Object -First 512 FullName,Length,Attributes,CreationTimeUtc,LastWriteTimeUtc |
+      Format-Table -AutoSize | Out-String -Width 4096
+  }
+}
+Show-Tree 'OMARCHYINST' ([string]$state.omarchyinstGuid)
+Show-Tree 'CIDATA' ([string]$state.cidataGuid)
+$esp=[string]$state.espVolumeGuid
+if ($esp) {
+  Show-Tree 'ESP Omarchy EFI' ($esp + 'EFI\OmarchyInstall')
+  Show-Tree 'ESP GRUB config' ($esp + 'boot\grub\grub.cfg')
+  if ($state.searchFilename) {
+    $bait=([string]$state.searchFilename).TrimStart('/').Replace('/','\')
+    Show-Tree 'ESP search bait' ($esp + $bait)
+  }
+}
+"#;
+
+const EVENT_DIAGNOSTIC_PS: &str = r#"
+$ErrorActionPreference='Stop'
+$start=(Get-Date).AddHours(-12)
+$system=@('VHDMP','Virtual Disk Service','disk','partmgr','volmgr','Ntfs','Microsoft-Windows-Kernel-PnP' |
+  ForEach-Object { Get-WinEvent -FilterHashtable @{LogName='System';ProviderName=$_;StartTime=$start} -ErrorAction SilentlyContinue })
+$application=@('Application Error','Windows Error Reporting','.NET Runtime' |
+  ForEach-Object { Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName=$_;StartTime=$start} -ErrorAction SilentlyContinue } |
+  Where-Object { $_.Message -match 'OmarchyInstaller|omarchy-install' })
+@($system;$application) |
+  Sort-Object TimeCreated -Descending |
+  Select-Object -First 200 TimeCreated,LogName,ProviderName,Id,LevelDisplayName,Message |
+  Format-List | Out-String -Width 4096
+"#;
+
+fn diagnostic_output(tool: SystemTool, args: &[&str]) -> (String, bool) {
     match system_command(tool).and_then(|mut command| {
         output_with_timeout(
             command.args(args),
@@ -896,13 +1104,22 @@ fn diagnostic_output(tool: SystemTool, args: &[&str]) -> String {
             "support-bundle diagnostic",
         )
     }) {
-        Ok(output) => format!(
-            "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        Ok(output) => {
+            let failed = !output.status.success();
+            (
+                format!(
+                    "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                failed,
+            )
+        }
+        Err(error) => (
+            format!("failed to execute Windows system tool: {error}"),
+            true,
         ),
-        Err(error) => format!("failed to execute Windows system tool: {error}"),
     }
 }
 
@@ -922,6 +1139,45 @@ fn run_powercfg(state: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_bundle_powershell_is_syntactically_valid() {
+        for script in [
+            STORAGE_DIAGNOSTIC_PS,
+            DISK_IMAGE_DIAGNOSTIC_PS,
+            PHYSICAL_DISK_DIAGNOSTIC_PS,
+            APP_FILE_DIAGNOSTIC_PS,
+            STAGING_FILE_DIAGNOSTIC_PS,
+            EVENT_DIAGNOSTIC_PS,
+        ] {
+            let output = system_command(SystemTool::PowerShell)
+                .unwrap()
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[scriptblock]::Create($args[0]) | Out-Null",
+                    script,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_diagnostic_command_is_marked() {
+        let (output, failed) = diagnostic_output(
+            SystemTool::PowerShell,
+            &["-NoProfile", "-NonInteractive", "-Command", "exit 7"],
+        );
+        assert!(failed);
+        assert!(output.contains("exit: Some(7)"), "{output}");
+    }
 
     #[test]
     fn mounted_tree_paths_use_iso_separators() {

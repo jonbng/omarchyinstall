@@ -1,7 +1,7 @@
 {
   "name": "omarchyinstall",
   "private": true,
-  "version": "0.4.3",
+  "version": "0.4.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --no-bundle",
-    "check:rust": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "check:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "check:rust:release": "cargo test --release --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
     "react": "^19.1.0",
