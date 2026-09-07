@@ -1,12 +1,17 @@
-//! Read-only machine probe. Compiled only on Windows.
+// Read-only machine probe. Compiled only on Windows.
 
-use super::{process::run_storage_powershell_read_only, registry::get_hklm_dword};
+use super::{
+    native_storage::{self, InventoryEnvelope, NativePartition, NativeStorageReport},
+    process::run_storage_powershell_read_only,
+    registry::get_hklm_dword,
+    vds::{self, ShrinkReport},
+};
 use crate::error::{Error, Result};
 use crate::platform::{
     BitlockerVolume, BlockingReason, DiskMap, MachineProbe, PartitionMap, TargetEsp,
 };
 use crate::probe::{self, volume_is_fve};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use windows::{
     core::{w, PCWSTR},
@@ -39,8 +44,37 @@ const EFI_VARIABLE_ATTRIBUTES: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 const LDM_META: &str = "5808c8aa-7e8f-42e0-85d2-e1e90434cfb3";
 const LDM_DATA: &str = "af9b60a0-1431-4f62-bc68-3311714a69ad";
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeProbeDiagnostics {
+    pub protocol_version: u32,
+    pub elapsed_ms: u128,
+    pub inventory_envelope: Option<InventoryEnvelope>,
+    pub inventory: Option<NativeStorageReport>,
+    pub inventory_error: Option<String>,
+    pub shrink: Option<ShrinkReport>,
+    pub shrink_error: Option<String>,
+    pub bitlocker: BitlockerDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BitlockerDiagnostics {
+    pub elapsed_ms: u128,
+    pub volumes: Vec<PsBitlocker>,
+    pub error: Option<String>,
+}
+
 pub fn probe_machine() -> Result<MachineProbe> {
+    Ok(probe_machine_detailed()?.0)
+}
+
+pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagnostics)> {
+    let probe_started = Instant::now();
     let host = super::host_info()?;
+    // WMI is independent and occasionally slow. Let it overlap the strictly
+    // ordered native inventory -> VDS target query.
+    let bitlocker_thread = std::thread::spawn(query_bitlocker);
     let uefi = is_uefi();
     let secure_boot = secure_boot_enabled();
     let efi_vars_writable = if uefi {
@@ -49,25 +83,66 @@ pub fn probe_machine() -> Result<MachineProbe> {
         false
     };
     let (ram_installed_bytes, ram_total_phys_bytes, ram_avail_bytes) = ram_bytes();
-    let (inventory, inventory_failure) = match inventory_from_powershell() {
-        Ok(inventory) => (Some(inventory), None),
-        Err(error) => {
-            log::warn!("storage inventory failed: {error}");
-            (None, Some(error.to_string()))
-        }
-    };
-    let tpm_present = inventory
-        .as_ref()
-        .and_then(|i| i.tpm_present)
-        .unwrap_or_else(tpm_present_tbs);
+    let (inventory_envelope, inventory, inventory_failure) =
+        match native_storage::inventory_report() {
+            Ok(envelope) => {
+                let failure = envelope.error.clone();
+                let inventory = envelope.report.clone();
+                if let Some(inventory) = &inventory {
+                    log::info!(
+                        "native storage inventory completed in {} ms",
+                        inventory.elapsed_ms
+                    );
+                }
+                (Some(envelope), inventory, failure)
+            }
+            Err(error) => {
+                log::warn!("native storage inventory failed: {error}");
+                (None, None, Some(error.to_string()))
+            }
+        };
+    let tpm_present = tpm_present_tbs();
 
+    let (shrink, shrink_failure) = if let Some(inventory) = &inventory {
+        match vds::query_report(&inventory.boot_volume_guid, "C:\\") {
+            Ok(report) => {
+                log::info!(
+                    "native VDS shrink-capacity query completed in {} ms",
+                    report.elapsed_ms
+                );
+                let failure = report.error.clone().or_else(|| {
+                    report
+                        .max_reclaimable_bytes
+                        .is_none()
+                        .then(|| "VDS returned no shrink capacity.".into())
+                });
+                (Some(report), failure)
+            }
+            Err(error) => {
+                log::warn!("native VDS shrink-capacity query failed: {error}");
+                (None, Some(error.to_string()))
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let bitlocker_diagnostics = bitlocker_thread
+        .join()
+        .unwrap_or_else(|_| BitlockerDiagnostics {
+            elapsed_ms: 0,
+            volumes: Vec::new(),
+            error: Some("BitLocker WMI worker panicked".into()),
+        });
+    let bitlocker_inventory = bitlocker_diagnostics.volumes.clone();
+    let bitlocker_error = bitlocker_diagnostics.error.clone();
     let disks = inventory
         .as_ref()
-        .map(disks_from_inventory)
+        .map(|inventory| disks_from_inventory(inventory, shrink.as_ref()))
         .unwrap_or_default();
-    let mut bitlocker = inventory
+    let (mut bitlocker, bitlocker_association_failed) = inventory
         .as_ref()
-        .map(bitlocker_from_inventory)
+        .map(|inventory| bitlocker_for_boot_disk(inventory, bitlocker_inventory))
         .unwrap_or_default();
 
     overlay_fve_signatures(&mut bitlocker, &disks);
@@ -84,39 +159,93 @@ pub fn probe_machine() -> Result<MachineProbe> {
             (
                 None,
                 vec![BlockingReason::ProbeIncomplete {
-                    component: "Windows storage inventory".into(),
+                    component: "native Windows storage inventory".into(),
                     detail: inventory_failure
+                        .clone()
                         .unwrap_or_else(|| "Windows returned no storage data.".into()),
                 }],
             )
         });
-    if inventory
-        .as_ref()
-        .and_then(|i| i.bitlocker_error.as_ref())
-        .is_some()
-    {
+    if let Some(detail) = bitlocker_error {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
             component: "BitLocker WMI".into(),
-            detail: inventory
-                .as_ref()
-                .and_then(|i| i.bitlocker_error.clone())
-                .unwrap_or_else(|| "Windows did not return BitLocker status.".into()),
+            detail,
         });
     }
-    if inventory.as_ref().is_some_and(|i| {
-        i.bitlocker
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .any(|volume| volume.disk_number.is_none())
-    }) {
+    if bitlocker_association_failed {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
             component: "BitLocker volume-to-disk association".into(),
-            detail: "A BitLocker volume could not be matched to exactly one physical disk.".into(),
+            detail: "A BitLocker volume could not be matched to exactly one native volume extent."
+                .into(),
+        });
+    }
+    if inventory.is_some()
+        && shrink
+            .as_ref()
+            .and_then(|report| report.max_reclaimable_bytes)
+            .is_none()
+    {
+        inventory_reasons.push(BlockingReason::ProbeIncomplete {
+            component: "native VDS shrink-capacity query".into(),
+            detail: shrink_failure
+                .clone()
+                .unwrap_or_else(|| "VDS returned no result.".into()),
+        });
+    }
+    if inventory.as_ref().is_some_and(|inventory| {
+        !inventory
+            .disks
+            .iter()
+            .find(|disk| disk.number == inventory.boot_disk_number)
+            .is_some_and(|disk| {
+                disk.partitions.iter().any(|partition| {
+                    partition
+                        .mount_paths
+                        .iter()
+                        .any(|path| drive_letter(path).as_deref() == Some("C:"))
+                })
+            })
+    }) {
+        inventory_reasons.push(BlockingReason::ProbeIncomplete {
+            component: "Windows system partition association".into(),
+            detail: "The native volume inventory could not associate C: with exactly one partition on the Windows boot disk."
+                .into(),
         });
     }
 
     let linux_by_id = inventory.as_ref().and_then(linux_by_id_from_inventory);
+    if let Some(inventory) = &inventory {
+        if let Some(target) = inventory
+            .disks
+            .iter()
+            .find(|disk| disk.number == inventory.boot_disk_number)
+        {
+            if target.bus.eq_ignore_ascii_case("unknown") {
+                inventory_reasons.push(BlockingReason::ProbeIncomplete {
+                    component: "target disk bus classification".into(),
+                    detail: "Windows returned an unknown bus type for the boot target.".into(),
+                });
+            }
+            let c_partition = target.partitions.iter().find(|partition| {
+                partition
+                    .mount_paths
+                    .iter()
+                    .any(|path| drive_letter(path).as_deref() == Some("C:"))
+            });
+            if c_partition.is_some_and(|partition| partition.gpt_guid.is_none()) {
+                inventory_reasons.push(BlockingReason::ProbeIncomplete {
+                    component: "Windows C: GPT identity".into(),
+                    detail: "The C: partition has no stable GPT partition GUID.".into(),
+                });
+            }
+        }
+        if linux_by_id.is_none() {
+            inventory_reasons.push(BlockingReason::ProbeIncomplete {
+                component: "target Linux disk identity".into(),
+                detail: "The target disk did not expose enough model/serial identity to construct /dev/disk/by-id.".into(),
+            });
+        }
+    }
 
     let probe = MachineProbe {
         host,
@@ -135,7 +264,17 @@ pub fn probe_machine() -> Result<MachineProbe> {
         disks,
         blocking_reasons: inventory_reasons,
     };
-    Ok(probe::attach_reasons(probe, true))
+    let diagnostics = NativeProbeDiagnostics {
+        protocol_version: 2,
+        elapsed_ms: probe_started.elapsed().as_millis(),
+        inventory_envelope,
+        inventory,
+        inventory_error: inventory_failure,
+        shrink,
+        shrink_error: shrink_failure,
+        bitlocker: bitlocker_diagnostics,
+    };
+    Ok((probe::attach_reasons(probe, true), diagnostics))
 }
 
 fn is_uefi() -> bool {
@@ -257,134 +396,32 @@ fn ram_bytes() -> (u64, u64, u64) {
 }
 
 fn tpm_present_tbs() -> bool {
-    // TBS is optional on some SKUs; the Storage/TPM PowerShell inventory is preferred.
+    // TBS is optional on some SKUs, so retain the registry fallback.
     std::path::Path::new(r"\\.\TPM").exists()
         || get_hklm_dword(w!("SYSTEM\\CurrentControlSet\\Services\\TPM"), w!("Start")).is_some()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Inventory {
-    disks: Option<Vec<PsDisk>>,
-    partitions: Option<Vec<PsPart>>,
-    shrink: Option<Vec<PsShrink>>,
     bitlocker: Option<Vec<PsBitlocker>>,
-    bitlocker_error: Option<String>,
-    tpm_present: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PsDisk {
-    number: Option<u32>,
-    size: Option<u64>,
-    partition_style: Option<String>,
-    is_boot: Option<bool>,
-    bus_type: Option<serde_json::Value>,
-    serial_number: Option<String>,
-    model: Option<String>,
-    friendly_name: Option<String>,
-    guid: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PsPart {
-    disk_number: Option<u32>,
-    drive_letter: Option<String>,
-    size: Option<u64>,
-    gpt_type: Option<String>,
-    guid: Option<String>,
-    file_system: Option<String>,
-    file_system_label: Option<String>,
-    offset: Option<u64>,
-    volume_unique_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PsShrink {
-    disk_number: Option<u32>,
-    size_min: Option<u64>,
-    size: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PsBitlocker {
+pub(crate) struct PsBitlocker {
     device_id: Option<String>,
-    disk_number: Option<u32>,
     mount: Option<String>,
     protection: Option<u32>,
     conversion: Option<u32>,
 }
 
-const DISK_INVENTORY_PS: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-$disks = @(Get-Disk | ForEach-Object {
-  [ordered]@{
-    number = [int]$_.Number
-    size = [uint64]$_.Size
-    partitionStyle = [string]$_.PartitionStyle
-    isBoot = [bool]$_.IsBoot
-    busType = [string]$_.BusType
-    serialNumber = [string]$_.SerialNumber
-    model = [string]$_.Model
-    friendlyName = [string]$_.FriendlyName
-    guid = [string]$_.Guid
-  }
-})
-@{ disks = $disks } | ConvertTo-Json -Depth 4 -Compress
-"#;
-
-const PARTITION_INVENTORY_PS: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-$parts = @(Get-Partition | ForEach-Object {
-  $letter = if ($_.DriveLetter) { [string]$_.DriveLetter } else { $null }
-  $vol = $null
-  try { $vol = Get-Volume -Partition $_ -ErrorAction Stop } catch {}
-  [ordered]@{
-    diskNumber = [int]$_.DiskNumber
-    driveLetter = $letter
-    size = [uint64]$_.Size
-    gptType = [string]$_.GptType
-    guid = [string]$_.Guid
-    type = [string]$_.Type
-    isBoot = [bool]$_.IsBoot
-    isSystem = [bool]$_.IsSystem
-    isHidden = [bool]$_.IsHidden
-    fileSystem = if ($vol) { [string]$vol.FileSystemType } else { $null }
-    fileSystemLabel = if ($vol) { [string]$vol.FileSystemLabel } else { $null }
-    offset = [uint64]$_.Offset
-    volumeUniqueId = if ($vol) { [string]$vol.UniqueId } else { $null }
-  }
-})
-@{ partitions = $parts } | ConvertTo-Json -Depth 5 -Compress
-"#;
-
-const SHRINK_INVENTORY_PS: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-$systemLetter = $env:SystemDrive.TrimEnd(':')
-$p = Get-Partition -DriveLetter $systemLetter
-$s = Get-PartitionSupportedSize -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber
-$shrink = @([ordered]@{
-  diskNumber = [int]$p.DiskNumber
-  sizeMin = [uint64]$s.SizeMin
-  size = [uint64]$p.Size
-})
-@{ shrink = $shrink } | ConvertTo-Json -Depth 4 -Compress
-"#;
-
 const BITLOCKER_INVENTORY_PS: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
 $bitlocker = @(Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume | ForEach-Object {
-    $device = [string]$_.DeviceID
     [ordered]@{
-      deviceId = $device
+      deviceId = [string]$_.DeviceID
       mount = [string]$_.DriveLetter
       protection = [uint32]$_.ProtectionStatus
       conversion = [uint32]$_.ConversionStatus
@@ -392,33 +429,6 @@ $bitlocker = @(Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEn
 })
 @{ bitlocker = $bitlocker } | ConvertTo-Json -Depth 4 -Compress
 "#;
-
-fn inventory_from_powershell() -> Result<Inventory> {
-    let disks = run_inventory_stage("Windows disk inventory", DISK_INVENTORY_PS, 25)?;
-    let partitions = run_inventory_stage(
-        "Windows partition and volume inventory",
-        PARTITION_INVENTORY_PS,
-        25,
-    )?;
-    let shrink = run_inventory_stage("Windows shrink-capacity check", SHRINK_INVENTORY_PS, 25)?;
-    let (bitlocker, bitlocker_error) =
-        match run_inventory_stage("BitLocker WMI", BITLOCKER_INVENTORY_PS, 15) {
-            Ok(stage) => (stage.bitlocker, None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-
-    let mut inventory = Inventory {
-        disks: disks.disks,
-        partitions: partitions.partitions,
-        shrink: shrink.shrink,
-        bitlocker,
-        bitlocker_error,
-        // The native TBS/registry probe remains available without PowerShell.
-        tpm_present: None,
-    };
-    associate_bitlocker_disks(&mut inventory);
-    Ok(inventory)
-}
 
 fn run_inventory_stage(description: &str, script: &str, timeout_seconds: u64) -> Result<Inventory> {
     let started = Instant::now();
@@ -435,164 +445,6 @@ fn run_inventory_stage(description: &str, script: &str, timeout_seconds: u64) ->
         Err(error) => log::warn!("{description} failed after {elapsed_ms} ms: {error}"),
     }
     result
-}
-
-fn associate_bitlocker_disks(inventory: &mut Inventory) {
-    let Some(bitlocker) = inventory.bitlocker.as_mut() else {
-        return;
-    };
-    let parts = inventory.partitions.as_deref().unwrap_or(&[]);
-    for volume in bitlocker {
-        volume.disk_number = parts
-            .iter()
-            .find(|part| {
-                part.volume_unique_id
-                    .as_deref()
-                    .zip(volume.device_id.as_deref())
-                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
-                    || part
-                        .drive_letter
-                        .as_deref()
-                        .zip(volume.mount.as_deref())
-                        .is_some_and(|(left, right)| {
-                            left.trim_end_matches(':')
-                                .eq_ignore_ascii_case(right.trim_end_matches(':'))
-                        })
-            })
-            .and_then(|part| part.disk_number);
-    }
-}
-
-fn disks_from_inventory(inv: &Inventory) -> Vec<DiskMap> {
-    let parts = inv.partitions.as_deref().unwrap_or(&[]);
-    let shrink = inv.shrink.as_deref().unwrap_or(&[]);
-    let mut out = Vec::new();
-    for disk in inv.disks.as_deref().unwrap_or(&[]) {
-        let number = disk.number.unwrap_or(0);
-        let style = disk
-            .partition_style
-            .as_deref()
-            .unwrap_or("raw")
-            .to_ascii_lowercase();
-        let bus = bus_string(&disk.bus_type);
-        let is_rst = bus_is_rst(&bus, disk.friendly_name.as_deref(), disk.model.as_deref());
-        let is_storage_spaces = bus.to_ascii_lowercase().contains("storagespaces")
-            || disk
-                .friendly_name
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains("storage space");
-        let disk_parts: Vec<PartitionMap> = parts
-            .iter()
-            .filter(|p| p.disk_number == Some(number))
-            .map(partition_from_ps)
-            .collect();
-        let is_dynamic = disk_parts.iter().any(|p| {
-            p.type_guid
-                .as_deref()
-                .map(|g| {
-                    let g = g
-                        .trim_matches(|c| c == '{' || c == '}')
-                        .to_ascii_lowercase();
-                    g == LDM_META || g == LDM_DATA
-                })
-                .unwrap_or(false)
-        });
-        let max_shrink_bytes = shrink
-            .iter()
-            .filter(|s| s.disk_number == Some(number))
-            .filter_map(|s| match (s.size, s.size_min) {
-                (Some(size), Some(min)) if size > min => Some(size - min),
-                _ => None,
-            })
-            .max();
-        out.push(DiskMap {
-            device_id: format!(r"\\.\PHYSICALDRIVE{number}"),
-            size_bytes: disk.size.unwrap_or(0),
-            partition_style: style,
-            bus: Some(bus),
-            is_boot: disk.is_boot.unwrap_or(false),
-            is_rst,
-            is_dynamic,
-            is_storage_spaces,
-            max_shrink_bytes,
-            partitions: disk_parts,
-        });
-    }
-    out
-}
-
-fn partition_from_ps(p: &PsPart) -> PartitionMap {
-    let letter = p.drive_letter.as_ref().and_then(|s| {
-        let s = s.trim();
-        if s.is_empty() {
-            None
-        } else if s.ends_with(':') {
-            Some(s.to_string())
-        } else {
-            Some(format!("{s}:"))
-        }
-    });
-    PartitionMap {
-        gpt_guid: p.guid.clone().filter(|s| !s.is_empty()),
-        type_guid: p.gpt_type.clone().filter(|s| !s.is_empty()),
-        letter,
-        label: p.file_system_label.clone().filter(|s| !s.is_empty()),
-        size_bytes: p.size.unwrap_or(0),
-        offset_bytes: p.offset.unwrap_or(0),
-        fs: p.file_system.clone().filter(|s| !s.is_empty()),
-    }
-}
-
-fn bus_string(v: &Option<serde_json::Value>) -> String {
-    match v {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Number(n)) => n.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn bus_is_rst(bus: &str, friendly: Option<&str>, model: Option<&str>) -> bool {
-    let bus_l = bus.to_ascii_lowercase();
-    if bus_l == "raid" || bus_l == "8" {
-        return true;
-    }
-    let blob =
-        format!("{} {} {}", bus, friendly.unwrap_or(""), model.unwrap_or("")).to_ascii_lowercase();
-    blob.contains("iasta")
-        || blob.contains("iastor")
-        || blob.contains("intel rst")
-        || blob.contains("vmd")
-        || blob.contains("raid volume")
-}
-
-fn bitlocker_from_inventory(inv: &Inventory) -> Vec<BitlockerVolume> {
-    let target_number = inv
-        .disks
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|d| d.is_boot.unwrap_or(false))
-        .and_then(|d| d.number);
-    inv.bitlocker
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|b| target_number.is_some() && b.disk_number == target_number)
-        .map(|b| {
-            let conversion_status = b.conversion.unwrap_or(u32::MAX);
-            let protection = b.protection.unwrap_or(0);
-            BitlockerVolume {
-                device_id: b.device_id.clone(),
-                disk_id: target_number.map(|n| format!(r"\\.\PHYSICALDRIVE{n}")),
-                mount: b.mount.clone().filter(|s| !s.trim().is_empty()),
-                protection_status: protection,
-                conversion_status,
-                fully_decrypted: protection == 0 && conversion_status == 0,
-            }
-        })
-        .collect()
 }
 
 fn overlay_fve_signatures(bitlocker: &mut Vec<BitlockerVolume>, disks: &[DiskMap]) {
@@ -622,80 +474,241 @@ fn overlay_fve_signatures(bitlocker: &mut Vec<BitlockerVolume>, disks: &[DiskMap
     }
 }
 
-fn target_esp_from_inventory(inv: &Inventory) -> (Option<TargetEsp>, Vec<BlockingReason>) {
-    let Some(disk) = inv
+fn query_bitlocker() -> BitlockerDiagnostics {
+    let started = Instant::now();
+    match run_inventory_stage("BitLocker WMI", BITLOCKER_INVENTORY_PS, 15) {
+        Ok(inventory) => BitlockerDiagnostics {
+            elapsed_ms: started.elapsed().as_millis(),
+            volumes: inventory.bitlocker.unwrap_or_default(),
+            error: None,
+        },
+        Err(error) => BitlockerDiagnostics {
+            elapsed_ms: started.elapsed().as_millis(),
+            volumes: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn disks_from_inventory(
+    inventory: &NativeStorageReport,
+    shrink: Option<&ShrinkReport>,
+) -> Vec<DiskMap> {
+    inventory
         .disks
-        .as_deref()
-        .unwrap_or(&[])
         .iter()
-        .find(|d| d.is_boot.unwrap_or(false))
+        .map(|disk| {
+            let bus_l = disk.bus.to_ascii_lowercase();
+            let identity = format!(
+                "{} {} {}",
+                disk.bus,
+                disk.model.as_deref().unwrap_or(""),
+                disk.serial.as_deref().unwrap_or("")
+            );
+            let is_dynamic = disk.partitions.iter().any(|partition| {
+                partition.type_guid.as_deref().is_some_and(|guid| {
+                    let guid = normalize_guid(guid);
+                    guid == LDM_META || guid == LDM_DATA
+                })
+            });
+            DiskMap {
+                device_id: disk.device_id.clone(),
+                size_bytes: disk.size_bytes,
+                partition_style: disk.partition_style.clone(),
+                bus: Some(disk.bus.clone()),
+                is_boot: disk.number == inventory.boot_disk_number,
+                is_rst: bus_l == "raid"
+                    || identity.to_ascii_lowercase().contains("iasta")
+                    || identity.to_ascii_lowercase().contains("iastor")
+                    || identity.to_ascii_lowercase().contains("intel rst")
+                    || identity.to_ascii_lowercase().contains("vmd"),
+                is_dynamic,
+                is_storage_spaces: bus_l == "storagespaces",
+                max_shrink_bytes: (disk.number == inventory.boot_disk_number)
+                    .then(|| shrink.and_then(|report| report.max_reclaimable_bytes))
+                    .flatten(),
+                partitions: disk.partitions.iter().map(partition_from_native).collect(),
+            }
+        })
+        .collect()
+}
+
+fn partition_from_native(partition: &NativePartition) -> PartitionMap {
+    let letter = partition
+        .mount_paths
+        .iter()
+        .find_map(|path| drive_letter(path));
+    PartitionMap {
+        gpt_guid: partition.gpt_guid.clone(),
+        type_guid: partition.type_guid.clone(),
+        letter,
+        label: partition.label.clone(),
+        size_bytes: partition.size_bytes,
+        offset_bytes: partition.offset_bytes,
+        fs: partition.fs.clone(),
+    }
+}
+
+fn drive_letter(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        .then(|| format!("{}:", (bytes[0] as char).to_ascii_uppercase()))
+}
+
+fn bitlocker_for_boot_disk(
+    inventory: &NativeStorageReport,
+    bitlocker: Vec<PsBitlocker>,
+) -> (Vec<BitlockerVolume>, bool) {
+    let mut association_failed = false;
+    let mut output = Vec::new();
+    for item in bitlocker {
+        let matched = inventory.volumes.iter().find(|volume| {
+            volume
+                .volume_guid
+                .as_str()
+                .eq_ignore_ascii_case(item.device_id.as_deref().unwrap_or(""))
+                || volume.mount_paths.iter().any(|path| {
+                    item.mount.as_deref().is_some_and(|mount| {
+                        path.trim_end_matches('\\')
+                            .eq_ignore_ascii_case(mount.trim_end_matches([':', '\\']))
+                            || drive_letter(path).as_deref().is_some_and(|letter| {
+                                letter.eq_ignore_ascii_case(mount.trim_end_matches('\\'))
+                            })
+                    })
+                })
+        });
+        let affects_target = item.mount.as_deref().is_some_and(|mount| {
+            drive_letter(mount).as_deref() == Some("C:")
+                || mount
+                    .trim_end_matches(['\\', ':'])
+                    .eq_ignore_ascii_case("C")
+        });
+        let Some(volume) = matched else {
+            association_failed |= affects_target;
+            continue;
+        };
+        if volume.extents.len() != 1 {
+            association_failed |= affects_target;
+            continue;
+        }
+        if volume.extents[0].disk_number != inventory.boot_disk_number {
+            continue;
+        }
+        let conversion_status = item.conversion.unwrap_or(u32::MAX);
+        let protection_status = item.protection.unwrap_or(0);
+        output.push(BitlockerVolume {
+            device_id: item.device_id,
+            disk_id: Some(format!(r"\\.\PHYSICALDRIVE{}", inventory.boot_disk_number)),
+            mount: item.mount.filter(|mount| !mount.trim().is_empty()),
+            protection_status,
+            conversion_status,
+            fully_decrypted: protection_status == 0 && conversion_status == 0,
+        });
+    }
+    (output, association_failed)
+}
+
+fn target_esp_from_inventory(
+    inventory: &NativeStorageReport,
+) -> (Option<TargetEsp>, Vec<BlockingReason>) {
+    let Some(disk) = inventory
+        .disks
+        .iter()
+        .find(|disk| disk.number == inventory.boot_disk_number)
     else {
         return (
             None,
             vec![BlockingReason::ProbeIncomplete {
                 component: "Windows boot disk identity".into(),
-                detail: "Windows did not identify a boot disk in the storage inventory.".into(),
+                detail: format!(
+                    "Native inventory did not contain PhysicalDrive{}.",
+                    inventory.boot_disk_number
+                ),
             }],
         );
     };
-    let number = disk.number.unwrap_or(u32::MAX);
-    let disk_id = format!(r"\\.\PHYSICALDRIVE{number}");
-    let candidates: Vec<&PsPart> = inv
+    let candidates: Vec<&NativePartition> = disk
         .partitions
-        .as_deref()
-        .unwrap_or(&[])
         .iter()
-        .filter(|p| {
-            p.disk_number == Some(number)
-                && p.gpt_type.as_deref().map(normalize_guid).as_deref()
-                    == Some("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+        .filter(|partition| {
+            partition
+                .type_guid
+                .as_deref()
+                .map(normalize_guid)
+                .as_deref()
+                == Some("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
         })
         .collect();
     if candidates.is_empty() {
-        return (None, vec![BlockingReason::MissingEsp { disk_id }]);
+        return (
+            None,
+            vec![BlockingReason::MissingEsp {
+                disk_id: disk.device_id.clone(),
+            }],
+        );
     }
     if candidates.len() != 1 {
         return (
             None,
             vec![BlockingReason::AmbiguousEsp {
-                disk_id,
+                disk_id: disk.device_id.clone(),
                 count: candidates.len() as u32,
             }],
         );
     }
-    let part = candidates[0];
-    let Some(disk_guid) = disk.guid.clone().filter(|s| !s.is_empty()) else {
+    let partition = candidates[0];
+    let Some(disk_guid) = disk.disk_guid.clone() else {
         return (
             None,
             vec![BlockingReason::ProbeIncomplete {
                 component: "target GPT disk GUID".into(),
-                detail: "The Windows boot disk did not expose a GPT disk GUID.".into(),
+                detail: "The native drive layout did not contain a GPT disk GUID.".into(),
             }],
         );
     };
-    let (Some(partition_guid), Some(volume_guid)) = (
-        part.guid.clone().filter(|s| !s.is_empty()),
-        part.volume_unique_id.clone().filter(|s| !s.is_empty()),
-    ) else {
-        return (
-            None,
-            vec![BlockingReason::ProbeIncomplete {
-                component: "target ESP identity".into(),
-                detail: "The EFI system partition did not expose stable partition and volume identifiers."
-                    .into(),
-            }],
-        );
+    let (Some(partition_guid), Some(volume_guid)) =
+        (partition.gpt_guid.clone(), partition.volume_guid.clone())
+    else {
+        return (None, vec![BlockingReason::ProbeIncomplete {
+            component: "target ESP identity".into(),
+            detail: "The native inventory could not associate the ESP with stable partition and volume GUIDs."
+                .into(),
+        }]);
     };
     (
         Some(TargetEsp {
-            disk_id: disk_id.clone(),
+            disk_id: disk.device_id.clone(),
             disk_guid,
-            disk_number: number,
+            disk_number: disk.number,
             partition_guid,
             volume_guid,
         }),
         vec![],
     )
+}
+
+fn linux_by_id_from_inventory(inventory: &NativeStorageReport) -> Option<String> {
+    let disk = inventory
+        .disks
+        .iter()
+        .find(|disk| disk.number == inventory.boot_disk_number)?;
+    let serial = disk
+        .serial
+        .as_deref()
+        .map(sanitize_id)
+        .filter(|s| !s.is_empty())?;
+    let model = disk
+        .model
+        .as_deref()
+        .map(sanitize_id)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "disk".into());
+    let prefix = if disk.bus.eq_ignore_ascii_case("nvme") {
+        "nvme"
+    } else {
+        "ata"
+    };
+    Some(format!("/dev/disk/by-id/{prefix}-{model}_{serial}"))
 }
 
 fn normalize_guid(value: &str) -> String {
@@ -742,32 +755,6 @@ fn read_fve(disk: &str, offset: u64) -> Option<bool> {
     }
 }
 
-fn linux_by_id_from_inventory(inv: &Inventory) -> Option<String> {
-    let disk = inv
-        .disks
-        .as_ref()?
-        .iter()
-        .find(|d| d.is_boot.unwrap_or(false))?;
-    let serial = disk
-        .serial_number
-        .as_deref()
-        .map(sanitize_id)
-        .filter(|s| !s.is_empty())?;
-    let model = disk
-        .model
-        .as_deref()
-        .map(sanitize_id)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "disk".into());
-    let bus = bus_string(&disk.bus_type).to_ascii_lowercase();
-    let prefix = if bus.contains("nvme") || bus == "17" {
-        "nvme"
-    } else {
-        "ata"
-    };
-    Some(format!("/dev/disk/by-id/{prefix}-{model}_{serial}"))
-}
-
 fn sanitize_id(s: &str) -> String {
     s.trim().replace([' ', '/'], "_")
 }
@@ -780,12 +767,7 @@ mod tests {
     #[test]
     fn staged_inventory_powershell_is_syntactically_valid() {
         const SCRIPT_ENV: &str = "OMARCHY_INSTALL_PROBE_PS_SYNTAX_TEST";
-        for script in [
-            DISK_INVENTORY_PS,
-            PARTITION_INVENTORY_PS,
-            SHRINK_INVENTORY_PS,
-            BITLOCKER_INVENTORY_PS,
-        ] {
+        for script in [BITLOCKER_INVENTORY_PS] {
             let output = system_command(SystemTool::PowerShell)
                 .unwrap()
                 .env(SCRIPT_ENV, script)

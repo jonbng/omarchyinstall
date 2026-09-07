@@ -95,7 +95,7 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
 }
 
 pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
-    let probe = crate::platform::probe_machine()?;
+    let (probe, native_diagnostics) = super::probe::probe_machine_detailed()?;
     probe::require_complete(&probe)?;
     let existing = load_journal()?;
     let has_started = existing
@@ -141,6 +141,38 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     if let Some(existing) = reuse_prepared(&journal, iso_size) {
         log::info!("prepare: OMARCHYINST and cidata already exist; skip shrink");
         return Ok(existing);
+    }
+    if matches!(
+        journal.step,
+        JournalStep::Planned | JournalStep::PowerPrepared
+    ) {
+        let volume_guid = native_diagnostics
+            .inventory
+            .as_ref()
+            .map(|inventory| inventory.boot_volume_guid.as_str())
+            .ok_or_else(|| {
+                Error::Message(
+                    "native Windows volume identity is unavailable for final shrink validation"
+                        .into(),
+                )
+            })?;
+        let required_shrink = journal
+            .old_c_size_bytes
+            .zip(journal.new_c_size_bytes)
+            .and_then(|(old, new)| old.checked_sub(new))
+            .unwrap_or(hole);
+        let final_shrink = super::vds::query_max_reclaimable(volume_guid, "C:\\")?
+            .max_reclaimable_bytes
+            .ok_or_else(|| Error::Message("VDS returned no final shrink capacity".into()))?;
+        let required_with_headroom = required_shrink
+            .checked_add(probe::SHRINK_HEADROOM_BYTES)
+            .ok_or_else(|| Error::Message("required shrink capacity overflow".into()))?;
+        if final_shrink < required_with_headroom {
+            return Err(Error::Message(format!(
+                "unmovable files leave only {final_shrink} shrinkable bytes; {required_shrink} bytes plus {} bytes of safety headroom are required",
+                probe::SHRINK_HEADROOM_BYTES
+            )));
+        }
     }
     if journal.target_disk_guid.is_none() {
         let esp = probe
@@ -814,7 +846,7 @@ pub fn export_support_bundle() -> Result<PathBuf> {
     let opts = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut manifest = format!(
         "Omarchy Install support bundle\n\
-         bundle-format: 2\n\
+         bundle-format: 3\n\
          app-version: {}\n\
          build-profile: {}\n\
          created-unix-ms: {}\n\
@@ -851,8 +883,8 @@ pub fn export_support_bundle() -> Result<PathBuf> {
         manifest.push_str("journal: absent\n");
     }
 
-    match crate::platform::probe_machine() {
-        Ok(probe) => {
+    match super::probe::probe_machine_detailed() {
+        Ok((probe, native_diagnostics)) => {
             manifest.push_str(&format!(
                 "probe: ok ({} disks, {} blocking reasons)\n",
                 probe.disks.len(),
@@ -865,10 +897,42 @@ pub fn export_support_bundle() -> Result<PathBuf> {
                 }
                 Err(error) => capture_errors.push(format!("probe.json serialization: {error}")),
             }
+            match serde_json::to_vec_pretty(&native_diagnostics) {
+                Ok(body) => {
+                    zip.start_file("native-storage.json", opts)?;
+                    zip.write_all(&body)?;
+                }
+                Err(error) => {
+                    capture_errors.push(format!("native-storage.json serialization: {error}"))
+                }
+            }
         }
         Err(error) => {
             manifest.push_str("probe: failed\n");
             capture_errors.push(format!("machine probe: {error}"));
+            let envelope = serde_json::json!({
+                "protocolVersion": 2,
+                "elapsedMs": 0,
+                "inventoryEnvelope": null,
+                "inventory": null,
+                "inventoryError": error.to_string(),
+                "shrink": null,
+                "shrinkError": null,
+                "bitlocker": {
+                    "elapsedMs": 0,
+                    "volumes": [],
+                    "error": "machine probe failed before BitLocker diagnostics were available"
+                }
+            });
+            match serde_json::to_vec_pretty(&envelope) {
+                Ok(body) => {
+                    zip.start_file("native-storage.json", opts)?;
+                    zip.write_all(&body)?;
+                }
+                Err(serialize_error) => capture_errors.push(format!(
+                    "native-storage.json failure-envelope serialization: {serialize_error}"
+                )),
+            }
         }
     }
 
@@ -905,13 +969,6 @@ pub fn export_support_bundle() -> Result<PathBuf> {
     }
 
     for (name, script) in [
-        (
-            "bitlocker-wmi.json",
-            "Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume | Select-Object DeviceID,DriveLetter,ProtectionStatus,ConversionStatus,EncryptionMethod | ConvertTo-Json -Depth 4",
-        ),
-        ("storage.json", STORAGE_DIAGNOSTIC_PS),
-        ("disk-images.json", DISK_IMAGE_DIAGNOSTIC_PS),
-        ("physical-disks.json", PHYSICAL_DISK_DIAGNOSTIC_PS),
         ("application-files.json", APP_FILE_DIAGNOSTIC_PS),
         ("staging-files.txt", STAGING_FILE_DIAGNOSTIC_PS),
         ("relevant-events.txt", EVENT_DIAGNOSTIC_PS),
@@ -1010,26 +1067,6 @@ fn write_diagnostic(
     }
     write_bundle_text(zip, name, &body, opts)
 }
-
-const STORAGE_DIAGNOSTIC_PS: &str = r#"
-$ErrorActionPreference='Stop'
-[ordered]@{
-  disks=@(Get-Disk | Select-Object Number,FriendlyName,SerialNumber,UniqueId,BusType,PartitionStyle,OperationalStatus,HealthStatus,IsBoot,IsSystem,IsOffline,IsReadOnly,Size,AllocatedSize,LargestFreeExtent)
-  partitions=@(Get-Partition | Select-Object DiskNumber,PartitionNumber,Guid,GptType,DriveLetter,Offset,Size,AccessPaths,NoDefaultDriveLetter,IsHidden,IsActive,IsBoot,IsSystem)
-  volumes=@(Get-Volume | Select-Object UniqueId,DriveLetter,FileSystemLabel,FileSystemType,DriveType,HealthStatus,OperationalStatus,Size,SizeRemaining,Path)
-} | ConvertTo-Json -Depth 6
-"#;
-
-const DISK_IMAGE_DIAGNOSTIC_PS: &str = r#"
-$ErrorActionPreference='Stop'
-@(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_DiskImage |
-  Select-Object ImagePath,ImageType,Attached,DevicePath,Size,StorageType) | ConvertTo-Json -Depth 4
-"#;
-
-const PHYSICAL_DISK_DIAGNOSTIC_PS: &str = r#"
-$ErrorActionPreference='Stop'
-@(Get-CimInstance Win32_DiskDrive | Select-Object Index,Model,SerialNumber,InterfaceType,MediaType,PNPDeviceID,Size,Status) | ConvertTo-Json -Depth 4
-"#;
 
 const APP_FILE_DIAGNOSTIC_PS: &str = r#"
 $ErrorActionPreference='Stop'
@@ -1147,9 +1184,6 @@ mod tests {
     fn support_bundle_powershell_is_syntactically_valid() {
         const SCRIPT_ENV: &str = "OMARCHY_INSTALL_PS_SYNTAX_TEST";
         for script in [
-            STORAGE_DIAGNOSTIC_PS,
-            DISK_IMAGE_DIAGNOSTIC_PS,
-            PHYSICAL_DISK_DIAGNOSTIC_PS,
             APP_FILE_DIAGNOSTIC_PS,
             STAGING_FILE_DIAGNOSTIC_PS,
             EVENT_DIAGNOSTIC_PS,

@@ -32,6 +32,8 @@ pub const MIB: u64 = 1024 * 1024;
 
 /// Default hole we need to shrink: 8 GiB `OMARCHYINST` + 512 MiB boot/cidata.
 pub const INSTALLER_HOLE_BYTES: u64 = 8 * GIB + 512 * MIB;
+/// Keep a small safety margin for filesystem/VDS changes between precheck and resize.
+pub const SHRINK_HEADROOM_BYTES: u64 = 64 * MIB;
 
 pub fn ram_ok_for_copytoram(installed: u64, total_phys: u64) -> bool {
     installed >= RAM_INSTALLED_MIN && total_phys >= RAM_TOTAL_PHYS_MIN
@@ -89,28 +91,26 @@ pub fn blocking_reasons(probe: &MachineProbe, check_elevation: bool) -> Vec<Bloc
                 disk_id: disk.device_id.clone(),
             });
         }
-        if disk.is_rst {
+        if disk.is_boot && disk.is_rst {
             out.push(BlockingReason::Rst {
                 disk_id: disk.device_id.clone(),
             });
         }
-        if disk.is_dynamic {
+        if disk.is_boot && disk.is_dynamic {
             out.push(BlockingReason::Dynamic {
                 disk_id: disk.device_id.clone(),
             });
         }
-        if disk.is_storage_spaces {
+        if disk.is_boot && disk.is_storage_spaces {
             out.push(BlockingReason::StorageSpaces {
                 disk_id: disk.device_id.clone(),
             });
         }
         if disk.is_boot {
             if let Some(have) = disk.max_shrink_bytes {
-                if have < INSTALLER_HOLE_BYTES {
-                    out.push(BlockingReason::ShrinkTooSmall {
-                        have,
-                        need: INSTALLER_HOLE_BYTES,
-                    });
+                let need = INSTALLER_HOLE_BYTES.saturating_add(SHRINK_HEADROOM_BYTES);
+                if have < need {
+                    out.push(BlockingReason::ShrinkTooSmall { have, need });
                 }
             }
         }
@@ -288,10 +288,38 @@ mod tests {
         match &p.blocking_reasons[..] {
             [BlockingReason::ShrinkTooSmall { have, need }] => {
                 assert_eq!(*have, GIB);
-                assert_eq!(*need, INSTALLER_HOLE_BYTES);
+                assert_eq!(*need, INSTALLER_HOLE_BYTES + SHRINK_HEADROOM_BYTES);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn shrink_headroom_boundary() {
+        let mut p = probe();
+        p.disks[0].max_shrink_bytes = Some(INSTALLER_HOLE_BYTES + SHRINK_HEADROOM_BYTES - 1);
+        assert!(attach_reasons(p.clone(), true)
+            .blocking_reasons
+            .iter()
+            .any(|reason| matches!(reason, BlockingReason::ShrinkTooSmall { .. })));
+        p.disks[0].max_shrink_bytes = Some(INSTALLER_HOLE_BYTES + SHRINK_HEADROOM_BYTES);
+        assert!(!attach_reasons(p, true)
+            .blocking_reasons
+            .iter()
+            .any(|reason| matches!(reason, BlockingReason::ShrinkTooSmall { .. })));
+    }
+
+    #[test]
+    fn unsupported_storage_on_secondary_disk_does_not_block() {
+        let mut p = probe();
+        let mut secondary = p.disks[0].clone();
+        secondary.device_id = r"\\.\PHYSICALDRIVE1".into();
+        secondary.is_boot = false;
+        secondary.is_rst = true;
+        secondary.is_dynamic = true;
+        secondary.is_storage_spaces = true;
+        p.disks.push(secondary);
+        assert!(attach_reasons(p, true).blocking_reasons.is_empty());
     }
 
     #[test]

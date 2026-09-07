@@ -4,9 +4,11 @@ mod dialog;
 mod elevation;
 mod iso_mount;
 mod mutate;
+mod native_storage;
 mod probe;
 mod process;
 mod registry;
+pub(crate) mod vds;
 
 use super::{
     BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,

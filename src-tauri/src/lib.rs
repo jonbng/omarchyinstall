@@ -14,6 +14,17 @@ mod platform;
 mod probe;
 mod winvol;
 
+/// Runs the private, bounded storage child-process protocol before Tauri starts.
+/// This is a no-op on non-Windows hosts and for normal application launches.
+pub fn run_storage_helper_if_requested() -> bool {
+    #[cfg(windows)]
+    {
+        return platform::windows::native_storage::run_helper_if_requested();
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(operation::OperationGate::default())

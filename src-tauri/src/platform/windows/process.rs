@@ -5,8 +5,23 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use windows::Win32::System::{SystemInformation::GetSystemDirectoryW, Threading::CREATE_NO_WINDOW};
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            SystemInformation::GetSystemDirectoryW,
+            Threading::CREATE_NO_WINDOW,
+        },
+    },
+};
 
 #[derive(Clone, Copy)]
 pub enum SystemTool {
@@ -101,6 +116,80 @@ pub fn output_with_timeout(
     })
 }
 
+/// Runs a private helper in a kill-on-close Job Object. If it times out, the
+/// whole helper process tree is terminated and reaped before this returns.
+pub fn output_with_timeout_in_job(
+    command: &mut Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<Output> {
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+    let job = OwnedJob(job);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )?;
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Err(error) = unsafe { AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle())) } {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Error::Message(format!(
+            "could not place {description} in its cleanup job: {error}"
+        )));
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Message(format!("could not capture {description} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Message(format!("could not capture {description} stderr")))?;
+    let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
+
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            let terminate_error = unsafe { TerminateJobObject(job.0, 1) }.err();
+            child.wait()?;
+            let _ = join_reader(stdout_reader, description, "stdout");
+            let _ = join_reader(stderr_reader, description, "stderr");
+            if let Some(error) = terminate_error {
+                return Err(Error::Message(format!(
+                    "{description} timed out and its process job could not be terminated: {error}"
+                )));
+            }
+            return Err(Error::Timeout {
+                description: description.into(),
+                seconds: timeout.as_secs(),
+            });
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_reader(stdout_reader, description, "stdout")?,
+        stderr: join_reader(stderr_reader, description, "stderr")?,
+    })
+}
+
+struct OwnedJob(HANDLE);
+
+impl Drop for OwnedJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pipe.read_to_end(&mut bytes)?;
@@ -190,6 +279,21 @@ mod tests {
         ]);
         let error = output_with_timeout(&mut command, Duration::from_millis(50), "timeout test")
             .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn job_bounded_output_times_out_and_reaps_the_helper() {
+        let mut command = system_command(SystemTool::PowerShell).unwrap();
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 5",
+        ]);
+        let error =
+            output_with_timeout_in_job(&mut command, Duration::from_millis(50), "job timeout test")
+                .unwrap_err();
         assert!(error.to_string().contains("timed out"));
     }
 }

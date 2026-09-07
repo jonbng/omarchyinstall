@@ -2,7 +2,7 @@
 //! so the UI and IPC still compile during development.
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(windows)]
 use self::windows as imp;
 
