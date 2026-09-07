@@ -49,12 +49,12 @@ mod tests {
     fn timeout_serializes_as_a_specific_message() {
         let json = serde_json::to_string(&Error::Timeout {
             description: "Windows storage inventory".into(),
-            seconds: 45,
+            seconds: 90,
         })
         .unwrap();
         assert_eq!(
             json,
-            r#""Windows storage inventory timed out after 45 seconds""#
+            r#""Windows storage inventory timed out after 90 seconds""#
         );
     }
 }

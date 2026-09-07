@@ -396,51 +396,33 @@ try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
 "#;
 
 fn inventory_from_powershell() -> Result<Inventory> {
-    const ATTEMPTS: u32 = 2;
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+    // Storage/CIM initialization on some Windows systems can take more than 45
+    // seconds. Restarting PowerShell at that point throws away useful progress,
+    // so give one read-only process the full bounded budget instead.
+    const INVENTORY_TIMEOUT: Duration = Duration::from_secs(90);
 
-    probe::retry_timeouts(ATTEMPTS, |attempt| {
-        let started = Instant::now();
-        let result = run_storage_powershell_read_only(INVENTORY_PS, ATTEMPT_TIMEOUT).and_then(
-            |stdout| {
-                serde_json::from_str(stdout.trim()).map_err(|error| {
-                    Error::Message(format!(
-                        "Windows storage inventory returned invalid JSON: {error}"
-                    ))
-                })
-            },
-        );
-        let elapsed_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    let result =
+        run_storage_powershell_read_only(INVENTORY_PS, INVENTORY_TIMEOUT).and_then(|stdout| {
+            serde_json::from_str(stdout.trim()).map_err(|error| {
+                Error::Message(format!(
+                    "Windows storage inventory returned invalid JSON: {error}"
+                ))
+            })
+        });
+    let elapsed_ms = started.elapsed().as_millis();
 
-        match &result {
-            Ok(_) => {
-                log::info!(
-                    "storage inventory attempt {attempt}/{ATTEMPTS} completed in {elapsed_ms} ms"
-                );
-            }
-            Err(Error::Timeout { .. }) if attempt < ATTEMPTS => {
-                log::warn!(
-                    "storage inventory attempt {attempt}/{ATTEMPTS} timed out after {elapsed_ms} ms; retrying"
-                );
-            }
-            Err(error) => {
-                log::warn!(
-                    "storage inventory attempt {attempt}/{ATTEMPTS} failed after {elapsed_ms} ms: {error}"
-                );
-            }
-        }
+    match &result {
+        Ok(_) => log::info!("storage inventory completed in {elapsed_ms} ms"),
+        Err(error) => log::warn!("storage inventory failed after {elapsed_ms} ms: {error}"),
+    }
 
-        result
-    })
-    .map_err(|failure| match failure.error {
-        Error::Timeout { .. } => Error::Message(format!(
-            "Windows storage inventory timed out twice ({} seconds total). Retry after closing Disk Management, file pickers, and other storage tools.",
-            ATTEMPT_TIMEOUT.as_secs() * u64::from(ATTEMPTS)
-        )),
-        error => Error::Message(format!(
-            "Windows storage inventory failed on attempt {}: {error}",
-            failure.attempt
-        )),
+    result.map_err(|error| match error {
+        Error::Timeout { .. } => Error::Message(
+            "Windows storage inventory did not finish within 90 seconds. Retry once; if it continues, reboot Windows before trying again."
+                .into(),
+        ),
+        error => Error::Message(format!("Windows storage inventory failed: {error}")),
     })
 }
 

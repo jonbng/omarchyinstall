@@ -90,7 +90,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .system-overview strong { overflow: hidden; text-overflow: ellipsis; font-size: .9rem; }
 .system-overview small { color: var(--muted); font-size: .68rem; }
 .probe-wait { justify-self: center; color: var(--muted); display: flex; align-items: center; gap: .6rem; }
-.probe-retrying { justify-self: stretch; margin: 0 0 .75rem; font-variant-numeric: tabular-nums; }
+.probe-running { justify-self: stretch; margin: 0 0 .75rem; font-variant-numeric: tabular-nums; }
 .cursor { width: .55rem; height: .9rem; background: var(--green); animation: blink 1.05s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .blocker { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: .7rem; padding: 1rem; border: 1px solid rgb(var(--rgb-red) / .28); background: var(--err-bg); }

@@ -4,34 +4,6 @@
 use crate::error::{Error, Result};
 use crate::platform::{BlockingReason, MachineProbe};
 
-#[cfg(any(windows, test))]
-#[derive(Debug)]
-pub(crate) struct AttemptFailure {
-    pub error: Error,
-    pub attempt: u32,
-}
-
-/// Runs an operation again only when it ends in a typed timeout. Keeping this
-/// policy outside the Windows module makes the retry behavior deterministic in
-/// tests on every host.
-#[cfg(any(windows, test))]
-pub(crate) fn retry_timeouts<T>(
-    attempts: u32,
-    mut operation: impl FnMut(u32) -> Result<T>,
-) -> std::result::Result<T, AttemptFailure> {
-    assert!(attempts > 0, "retry_timeouts requires at least one attempt");
-
-    for attempt in 1..=attempts {
-        match operation(attempt) {
-            Ok(value) => return Ok(value),
-            Err(Error::Timeout { .. }) if attempt < attempts => {}
-            Err(error) => return Err(AttemptFailure { error, attempt }),
-        }
-    }
-
-    unreachable!("retry loop always returns")
-}
-
 /// Refuses consumers that require trustworthy disk identity when any probe
 /// component was incomplete, while preserving the component's actual error.
 #[cfg(any(windows, test))]
@@ -352,84 +324,6 @@ mod tests {
             .blocking_reasons
             .iter()
             .any(|reason| matches!(reason, BlockingReason::MissingEsp { .. })));
-    }
-
-    #[test]
-    fn retry_timeout_then_success() {
-        let mut calls = Vec::new();
-        let value = retry_timeouts(2, |attempt| {
-            calls.push(attempt);
-            if attempt == 1 {
-                Err(Error::Timeout {
-                    description: "inventory".into(),
-                    seconds: 45,
-                })
-            } else {
-                Ok("inventory")
-            }
-        })
-        .unwrap();
-
-        assert_eq!(value, "inventory");
-        assert_eq!(calls, [1, 2]);
-    }
-
-    #[test]
-    fn retry_stops_after_two_timeouts() {
-        let mut calls = 0;
-        let failure = retry_timeouts::<()>(2, |_| {
-            calls += 1;
-            Err(Error::Timeout {
-                description: "inventory".into(),
-                seconds: 45,
-            })
-        })
-        .unwrap_err();
-
-        assert_eq!(calls, 2);
-        assert_eq!(failure.attempt, 2);
-        assert!(matches!(failure.error, Error::Timeout { seconds: 45, .. }));
-    }
-
-    #[test]
-    fn retry_does_not_repeat_process_failure() {
-        let mut calls = 0;
-        let failure = retry_timeouts::<()>(2, |_| {
-            calls += 1;
-            Err(Error::Message("PowerShell exited with code 1".into()))
-        })
-        .unwrap_err();
-
-        assert_eq!(calls, 1);
-        assert_eq!(failure.attempt, 1);
-        assert!(matches!(failure.error, Error::Message(_)));
-    }
-
-    #[test]
-    fn retry_does_not_repeat_malformed_json() {
-        let mut calls = 0;
-        let failure = retry_timeouts::<serde_json::Value>(2, |_| {
-            calls += 1;
-            serde_json::from_str("not json").map_err(|error| Error::Message(error.to_string()))
-        })
-        .unwrap_err();
-
-        assert_eq!(calls, 1);
-        assert_eq!(failure.attempt, 1);
-        assert!(matches!(failure.error, Error::Message(_)));
-    }
-
-    #[test]
-    fn retry_returns_first_attempt_success_without_repeating() {
-        let mut calls = 0;
-        let value = retry_timeouts(2, |attempt| {
-            calls += 1;
-            Ok(attempt)
-        })
-        .unwrap();
-
-        assert_eq!(value, 1);
-        assert_eq!(calls, 1);
     }
 
     #[test]

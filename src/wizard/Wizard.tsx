@@ -141,7 +141,7 @@ export default function Wizard() {
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.9");
+  const [version, setVersion] = useState("0.4.10");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
@@ -1000,7 +1000,7 @@ function ProbeStep({
   }, [probing, probeStartedAt]);
 
   const probeElapsed = Math.max(0, Math.floor((now - probeStartedAt) / 1_000));
-  const probeAttempt = probeElapsed < 45 ? 1 : 2;
+  const probeProgress = `checking Windows storage · ${probeElapsed}s · allow up to 90s`;
 
   async function exportDiagnostics() {
     setDiagnosticBusy(true);
@@ -1020,7 +1020,7 @@ function ProbeStep({
     return (
       <p className="probe-wait">
         <span className="cursor" />
-        checking Windows storage · attempt {probeAttempt} of 2 · {probeElapsed}s
+        {probeProgress}
       </p>
     );
   }
@@ -1062,9 +1062,9 @@ function ProbeStep({
   return (
     <div className="probe">
       {probing && (
-        <p className="probe-wait probe-retrying" role="status">
+        <p className="probe-wait probe-running" role="status">
           <span className="cursor" />
-          checking Windows storage · attempt {probeAttempt} of 2 · {probeElapsed}s
+          {probeProgress}
         </p>
       )}
       <div className={`system-result ${ready ? "ready" : "blocked"}`}>
