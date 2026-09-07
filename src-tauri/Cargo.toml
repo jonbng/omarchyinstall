@@ -36,7 +36,7 @@ tokio = { version = "1", features = ["sync", "time", "net", "rt-multi-thread"] }
 sha-crypt = "0.5"
 zeroize = "1"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-sequoia-openpgp = { version = "1.22", default-features = false, features = [
+sequoia-openpgp = { version = "2.1", default-features = false, features = [
     "crypto-rust",
     "allow-experimental-crypto",
     "allow-variable-time-crypto",
