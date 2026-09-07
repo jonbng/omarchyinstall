@@ -1,11 +1,22 @@
 use crate::cidata::CidataIdentity;
 use crate::download::{self, LocalIsoSelection, VerifyResult};
 use crate::error::Result;
+use crate::operation::OperationGate;
 use crate::platform::{
     self, BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
     StageResult, StateJournal,
 };
-use tauri::Emitter;
+use tauri::{Emitter, State};
+
+async fn run_blocking<T, F>(name: &'static str, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| crate::error::Error::Message(format!("{name} task failed: {error}")))?
+}
 
 #[tauri::command]
 pub fn exit_app(app: tauri::AppHandle) {
@@ -22,18 +33,21 @@ pub fn host_info() -> Result<HostInfo> {
 }
 
 #[tauri::command]
-pub fn probe_machine() -> Result<MachineProbe> {
-    platform::probe_machine()
+pub async fn probe_machine(operation: State<'_, OperationGate>) -> Result<MachineProbe> {
+    let _operation = operation.lock().await;
+    run_blocking("machine probe", platform::probe_machine).await
 }
 
 #[tauri::command]
-pub fn relaunch_elevated() -> Result<()> {
-    platform::relaunch_elevated()
+pub async fn relaunch_elevated(operation: State<'_, OperationGate>) -> Result<()> {
+    let _operation = operation.lock().await;
+    run_blocking("elevated relaunch", platform::relaunch_elevated).await
 }
 
 #[tauri::command]
-pub fn reboot_to_firmware() -> Result<()> {
-    platform::reboot_to_firmware()
+pub async fn reboot_to_firmware(operation: State<'_, OperationGate>) -> Result<()> {
+    let _operation = operation.lock().await;
+    run_blocking("firmware reboot", platform::reboot_to_firmware).await
 }
 
 #[tauri::command]
@@ -42,7 +56,11 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
 }
 
 #[tauri::command]
-pub async fn download_iso(app: tauri::AppHandle) -> Result<()> {
+pub async fn download_iso(
+    app: tauri::AppHandle,
+    operation: State<'_, OperationGate>,
+) -> Result<()> {
+    let _operation = operation.lock().await;
     let emit = |progress| {
         let _ = app.emit("iso://progress", &progress);
     };
@@ -55,7 +73,7 @@ pub async fn download_iso(app: tauri::AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn pick_local_iso(window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>> {
+pub async fn pick_local_iso(window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>> {
     #[cfg(windows)]
     let owner = Some(
         window
@@ -68,59 +86,103 @@ pub fn pick_local_iso(window: tauri::WebviewWindow) -> Result<Option<std::path::
         let _ = window;
         None
     };
-    platform::pick_local_iso(owner)
+    run_blocking("ISO file picker", move || platform::pick_local_iso(owner)).await
 }
 
 #[tauri::command]
-pub async fn prepare_local_iso(path: std::path::PathBuf) -> Result<LocalIsoSelection> {
+pub async fn prepare_local_iso(
+    path: std::path::PathBuf,
+    operation: State<'_, OperationGate>,
+) -> Result<LocalIsoSelection> {
+    let _operation = operation.lock().await;
     download::prepare_local_iso(&path).await
 }
 
 #[tauri::command]
-pub fn verify_iso(app: tauri::AppHandle) -> Result<VerifyResult> {
-    let emit = |progress| {
-        let _ = app.emit("iso://progress", &progress);
-    };
-    let result = if download::stub_skips_iso() {
-        download::skip_iso_verify(emit)?
-    } else {
-        download::verify_iso_files(emit)?
-    };
+pub async fn verify_iso(
+    app: tauri::AppHandle,
+    operation: State<'_, OperationGate>,
+) -> Result<VerifyResult> {
+    let _operation = operation.lock().await;
+    let progress_app = app.clone();
+    let result = run_blocking("ISO verification", move || {
+        let emit = move |progress| {
+            let _ = progress_app.emit("iso://progress", &progress);
+        };
+        if download::stub_skips_iso() {
+            download::skip_iso_verify(emit)
+        } else {
+            download::verify_iso_files(emit)
+        }
+    })
+    .await?;
     let _ = app.emit("iso://verified", &result);
     Ok(result)
 }
 
 #[tauri::command]
-pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
-    platform::prepare_installer_partition(allow_bitlocker)
+pub async fn prepare_installer_partition(
+    allow_bitlocker: bool,
+    operation: State<'_, OperationGate>,
+) -> Result<PrepareResult> {
+    let _operation = operation.lock().await;
+    run_blocking("installer partition preparation", move || {
+        platform::prepare_installer_partition(allow_bitlocker)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn stage_bootloader() -> Result<StageResult> {
-    platform::stage_bootloader()
+pub async fn stage_bootloader(operation: State<'_, OperationGate>) -> Result<StageResult> {
+    let _operation = operation.lock().await;
+    run_blocking("bootloader staging", platform::stage_bootloader).await
 }
 
 #[tauri::command]
-pub fn write_cidata(identity: CidataIdentity) -> Result<CidataResult> {
-    platform::write_cidata(identity)
+pub async fn write_cidata(
+    identity: CidataIdentity,
+    operation: State<'_, OperationGate>,
+) -> Result<CidataResult> {
+    let _operation = operation.lock().await;
+    run_blocking("cidata writing", move || platform::write_cidata(identity)).await
 }
 
 #[tauri::command]
-pub fn set_boot_next() -> Result<BootNextResult> {
-    platform::set_boot_next()
+pub async fn set_boot_next(operation: State<'_, OperationGate>) -> Result<BootNextResult> {
+    let _operation = operation.lock().await;
+    run_blocking("BootNext configuration", platform::set_boot_next).await
 }
 
 #[tauri::command]
-pub fn reboot_to_installer() -> Result<()> {
-    platform::reboot_to_installer()
+pub async fn reboot_to_installer(operation: State<'_, OperationGate>) -> Result<()> {
+    let _operation = operation.lock().await;
+    run_blocking("installer reboot", platform::reboot_to_installer).await
 }
 
 #[tauri::command]
-pub fn abort_and_rollback() -> Result<RollbackResult> {
-    platform::abort_and_rollback()
+pub async fn abort_and_rollback(operation: State<'_, OperationGate>) -> Result<RollbackResult> {
+    let _operation = operation.lock().await;
+    run_blocking("installer rollback", platform::abort_and_rollback).await
 }
 
 #[tauri::command]
-pub fn export_support_bundle() -> Result<std::path::PathBuf> {
-    platform::export_support_bundle()
+pub async fn export_support_bundle(
+    operation: State<'_, OperationGate>,
+) -> Result<std::path::PathBuf> {
+    let _operation = operation.lock().await;
+    run_blocking("support bundle export", platform::export_support_bundle).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocking_task_panics_are_reported() {
+        let error = tauri::async_runtime::block_on(run_blocking("test", || -> Result<()> {
+            panic!("intentional test panic")
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("test task failed"));
+    }
 }

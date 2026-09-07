@@ -1,6 +1,6 @@
 //! Secure loopback UI used when the native WebView cannot be created.
 
-use crate::{cidata::CidataIdentity, download, platform};
+use crate::{cidata::CidataIdentity, download, operation::OperationGate, platform};
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -19,7 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::{broadcast, Mutex};
 
 const SESSION_COOKIE: &str = "omarchy_session";
@@ -32,7 +32,7 @@ struct BrowserState {
     origin: Arc<str>,
     token: Arc<str>,
     events: broadcast::Sender<download::IsoProgress>,
-    operation: Arc<Mutex<()>>,
+    operation: OperationGate,
     last_seen: Arc<Mutex<Instant>>,
     active: Arc<AtomicUsize>,
 }
@@ -82,7 +82,7 @@ pub fn launch(app: &AppHandle, webview_error: &str) -> Result<(), String> {
         origin: origin.clone().into(),
         token: token.clone().into(),
         events: event_tx,
-        operation: Arc::new(Mutex::new(())),
+        operation: app.state::<OperationGate>().inner().clone(),
         last_seen: Arc::new(Mutex::new(Instant::now())),
         active: Arc::new(AtomicUsize::new(0)),
     };
@@ -279,10 +279,19 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
 
     match command {
         "host_info" => blocking!(platform::host_info()),
-        "probe_machine" => blocking!(platform::probe_machine()),
+        "probe_machine" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::probe_machine())
+        }
         "load_install_state" => blocking!(platform::load_install_state()),
-        "relaunch_elevated" => blocking!(platform::relaunch_elevated()),
-        "reboot_to_firmware" => blocking!(platform::reboot_to_firmware()),
+        "relaunch_elevated" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::relaunch_elevated())
+        }
+        "reboot_to_firmware" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::reboot_to_firmware())
+        }
         "download_iso" => {
             let _operation = state.operation.lock().await;
             let tx = state.events.clone();
@@ -357,7 +366,10 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             let _operation = state.operation.lock().await;
             blocking!(platform::abort_and_rollback())
         }
-        "export_support_bundle" => blocking!(platform::export_support_bundle()),
+        "export_support_bundle" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::export_support_bundle())
+        }
         "_version" => Ok(json!(env!("CARGO_PKG_VERSION"))),
         "_shutdown" => {
             let app = state.app.clone();

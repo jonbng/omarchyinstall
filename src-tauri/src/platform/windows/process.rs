@@ -1,6 +1,9 @@
 use crate::error::{Error, Result};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 use std::os::windows::process::CommandExt;
 use windows::Win32::System::{SystemInformation::GetSystemDirectoryW, Threading::CREATE_NO_WINDOW};
@@ -54,12 +57,96 @@ pub fn system_command(tool: SystemTool) -> Result<Command> {
     Ok(command)
 }
 
+pub fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Message(format!("could not capture {description} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Message(format!("could not capture {description} stderr")))?;
+    let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
+
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            if let Err(error) = child.kill() {
+                if child.try_wait()?.is_none() {
+                    return Err(Error::Message(format!(
+                        "{description} timed out and could not be terminated: {error}"
+                    )));
+                }
+            }
+            child.wait()?;
+            let _ = join_reader(stdout_reader, description, "stdout");
+            let _ = join_reader(stderr_reader, description, "stderr");
+            return Err(Error::Message(format!(
+                "{description} timed out after {} seconds",
+                timeout.as_secs()
+            )));
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_reader(stdout_reader, description, "stdout")?,
+        stderr: join_reader(stderr_reader, description, "stderr")?,
+    })
+}
+
+fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    description: &str,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    let bytes = reader
+        .join()
+        .map_err(|_| Error::Message(format!("{description} {stream} reader panicked")))??;
+    Ok(bytes)
+}
+
 /// Runs an in-box Windows PowerShell command for the Storage/CIM boundary.
 /// Callers must keep scripts fixed-format and validate or quote inserted values.
 pub fn run_storage_powershell(script: &str) -> Result<String> {
     let output = system_command(SystemTool::PowerShell)?
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()?;
+    if !output.status.success() {
+        return Err(Error::Message(format!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Runs the read-only Storage/CIM inventory with a bounded wait. Mutating
+/// storage commands deliberately use `run_storage_powershell` without a
+/// forced timeout so they cannot be killed halfway through a disk operation.
+pub fn run_storage_powershell_read_only(script: &str) -> Result<String> {
+    let output = output_with_timeout(
+        system_command(SystemTool::PowerShell)?.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]),
+        Duration::from_secs(30),
+        "Windows storage inventory",
+    )?;
     if !output.status.success() {
         return Err(Error::Message(format!(
             "powershell failed: {}",
@@ -86,5 +173,19 @@ mod tests {
             assert!(path.is_absolute(), "{}", path.display());
             assert!(path.is_file(), "{}", path.display());
         }
+    }
+
+    #[test]
+    fn bounded_output_times_out_and_reaps_the_child() {
+        let mut command = system_command(SystemTool::PowerShell).unwrap();
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 5",
+        ]);
+        let error = output_with_timeout(&mut command, Duration::from_millis(50), "timeout test")
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 }

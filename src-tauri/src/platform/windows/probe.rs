@@ -1,6 +1,6 @@
 //! Read-only machine probe. Compiled only on Windows.
 
-use super::{process::run_storage_powershell, registry::get_hklm_dword};
+use super::{process::run_storage_powershell_read_only, registry::get_hklm_dword};
 use crate::error::Result;
 use crate::platform::{
     BitlockerVolume, BlockingReason, DiskMap, MachineProbe, PartitionMap, TargetEsp,
@@ -382,7 +382,7 @@ try { $tpmPresent = [bool]((Get-Tpm).TpmPresent) } catch {}
 "#;
 
 fn inventory_from_powershell() -> Option<Inventory> {
-    let stdout = run_storage_powershell(INVENTORY_PS)
+    let stdout = run_storage_powershell_read_only(INVENTORY_PS)
         .inspect_err(|error| log::warn!("storage inventory powershell failed: {error}"))
         .ok()?;
     serde_json::from_str(stdout.trim())

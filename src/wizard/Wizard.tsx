@@ -90,11 +90,11 @@ const STEP_SLUG: Record<Step, string> = {
 };
 
 const INSTALL_PHASES = [
-  { id: "verify", label: "recheck installation media" },
-  { id: "prepare", label: "installer partitions" },
-  { id: "stage", label: "grub on esp" },
-  { id: "cidata", label: "autoinstall cidata" },
-  { id: "bootnext", label: "uefi bootnext" },
+  { id: "verify", label: "Recheck installation media" },
+  { id: "prepare", label: "Create installer partitions" },
+  { id: "stage", label: "Copy ISO and stage bootloader" },
+  { id: "cidata", label: "Write autoinstall configuration" },
+  { id: "bootnext", label: "Set one-time UEFI boot" },
 ] as const;
 
 function emptyIdentity(): CidataIdentity {
@@ -139,6 +139,7 @@ export default function Wizard() {
   const [abortOpen, setAbortOpen] = useState(false);
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
+  const abortRequested = useRef(false);
   const [version, setVersion] = useState("0.4.2");
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
@@ -410,6 +411,7 @@ export default function Wizard() {
       }
       return;
     }
+    abortRequested.current = true;
     setAbortBusy(true);
     try {
       await invoke("abort_and_rollback");
@@ -590,6 +592,7 @@ export default function Wizard() {
               journal={journal}
               expectedIso={iso.state.result}
               allowBitlocker={bitlockerActive && bitlockerRiskAccepted}
+              abortRequested={abortRequested}
               onStatus={(next) => {
                 setInstallPhase(next.phase);
                 setInstallReady(next.ready);
@@ -647,9 +650,15 @@ export default function Wizard() {
         <AbortDialog
           copy={abort}
           busy={abortBusy}
+          busyMessage={
+            abortBusy && kind !== "quit"
+              ? "Finishing the current step, then undoing changes…"
+              : undefined
+          }
+          stayDisabled={abortRequested.current}
           error={abortError}
           onStay={() => {
-            if (abortBusy) return;
+            if (abortBusy || abortRequested.current) return;
             setAbortOpen(false);
           }}
           onConfirm={() => void confirmAbort()}
@@ -1446,12 +1455,22 @@ function phaseState(
   return "todo";
 }
 
+function PhaseMark({ state }: { state: ReturnType<typeof phaseState> }) {
+  if (state === "run") {
+    return <span className="phase-spinner" aria-hidden="true" />;
+  }
+
+  const marks = { ok: "✓", fail: "!", skip: "—", todo: "·" } as const;
+  return <span aria-hidden="true">{marks[state]}</span>;
+}
+
 function MutateStep({
   native,
   identity,
   journal,
   expectedIso,
   allowBitlocker,
+  abortRequested,
   onStatus,
   onJournal,
   onClearPassword,
@@ -1463,6 +1482,7 @@ function MutateStep({
   journal: StateJournal | null;
   expectedIso: VerifyResult | null;
   allowBitlocker: boolean;
+  abortRequested: { current: boolean };
   onStatus: (next: { phase: string; ready: boolean; rebooting: boolean }) => void;
   onJournal: (next: StateJournal | null) => void;
   onClearPassword: () => void;
@@ -1504,7 +1524,7 @@ function MutateStep({
 
     void (async () => {
       unlisten = await listen<IsoProgress>("iso://progress", (event) => {
-        if (cancelled) return;
+        if (cancelled || abortRequested.current) return;
         setPhase("verify");
         setBytes(event.payload.bytes);
         setTotal(event.payload.total);
@@ -1518,7 +1538,7 @@ function MutateStep({
         setBundlePath(null);
         const current =
           (await invoke<StateJournal | null>("load_install_state").catch(() => null)) ?? journal;
-        if (cancelled) return;
+        if (cancelled || abortRequested.current) return;
         if (current) onJournalRef.current(current);
         const start = installStartFromJournal(current?.step);
         if (start === "done") {
@@ -1539,7 +1559,7 @@ function MutateStep({
             throw new Error("The installation media is no longer approved. Verify it again before continuing.");
           }
           const result = await invoke<VerifyResult>("verify_iso");
-          if (cancelled) return;
+          if (cancelled || abortRequested.current) return;
           if (result.sha256 !== expected.sha256 || result.bytes !== expected.bytes) {
             throw new Error("The installation media changed after review. Verify it again before continuing.");
           }
@@ -1549,28 +1569,28 @@ function MutateStep({
           setTotal(result.bytes);
           setPhase("prepare");
           await invoke("prepare_installer_partition", { allowBitlocker });
-          if (cancelled) return;
+          if (cancelled || abortRequested.current) return;
         }
         if (start === "prepare" || start === "stage") {
           setPhase("stage");
           await invoke("stage_bootloader");
-          if (cancelled) return;
+          if (cancelled || abortRequested.current) return;
         }
         if (start === "prepare" || start === "stage" || start === "cidata") {
           setPhase("cidata");
           await invoke("write_cidata", { identity: identityRef.current });
-          if (cancelled) return;
+          if (cancelled || abortRequested.current) return;
         }
         setPhase("bootnext");
         await invoke("set_boot_next");
-        if (cancelled) return;
+        if (cancelled || abortRequested.current) return;
         const next = await invoke<StateJournal | null>("load_install_state").catch(() => null);
         if (next) onJournalRef.current(next);
         onClearPasswordRef.current();
         setPhase("done");
         setReady(true);
       } catch (err: unknown) {
-        if (cancelled) return;
+        if (cancelled || abortRequested.current) return;
         const message = invokeError(err);
         if (message.toLowerCase().includes("only available on windows")) {
           setWindowsOnly(true);
@@ -1590,8 +1610,12 @@ function MutateStep({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, allowBitlocker]);
 
+  // Only verification reports byte progress. Later phases must remain
+  // indeterminate instead of reusing the completed verification percentage.
   const pct =
-    total && total > 0 ? Math.min(100, Math.round((bytes / total) * 100)) : null;
+    phase === "verify" && total && total > 0
+      ? Math.min(100, Math.round((bytes / total) * 100))
+      : null;
   const label =
     phase === "verify"
       ? "Rechecking installation media"
@@ -1617,38 +1641,68 @@ function MutateStep({
     !windowsOnly &&
     phase !== "idle" &&
     phase !== "stopped";
+  const activityDetail =
+    phase === "verify"
+      ? pct != null
+        ? `${formatBytes(bytes)} of ${formatBytes(total ?? 0)} · ${pct}%`
+        : "Reading and checking the ISO"
+      : phase === "prepare"
+        ? "Windows may take several minutes to resize the disk"
+        : phase === "stage"
+          ? "Copying the ISO and installer files"
+          : phase === "cidata"
+            ? "Saving your installation settings"
+            : phase === "bootnext"
+              ? "Registering the installer for the next restart"
+              : "Working";
 
   return (
     <div className="copy">
       <p className="kicker">install</p>
-      <h2>{label}</h2>
+      <div className="install-heading" role="status" aria-live="polite">
+        {working && <span className="install-spinner" aria-hidden="true" />}
+        <div>
+          <h2>{label}</h2>
+          {working && <p>{activityDetail}</p>}
+        </div>
+      </div>
       <ul className="log">
         {INSTALL_PHASES.map((item) => {
           const state = phaseState(item.id, phase, ready, windowsOnly, !!error);
           return (
             <li key={item.id} className={state}>
-              <span>{state === "todo" ? "··" : state}</span>
-              <span>
-                {item.label}
+              <span className="phase-mark"><PhaseMark state={state} /></span>
+              <span>{item.label}</span>
+              <span className="phase-status">
+                {state === "ok"
+                  ? "Done"
+                  : state === "run"
+                    ? item.id === "verify" && pct != null
+                      ? `${pct}%`
+                      : "Working…"
+                    : state === "fail"
+                      ? "Failed"
+                      : state === "skip"
+                        ? "Skipped"
+                        : "Waiting"}
               </span>
-              {item.id === "verify" && working && phase === "verify" && (
-                <span>
-                  {formatBytes(bytes)}
-                  {total != null ? ` / ${formatBytes(total)}` : ""}
-                  {pct != null ? `  ${pct}%` : ""}
-                </span>
-              )}
             </li>
           );
         })}
       </ul>
       {working && (
-        <div
-          className={`progress ${pct == null ? "indeterminate" : ""}`}
-          role="progressbar"
-          aria-valuenow={pct ?? undefined}
-        >
-          <span style={{ width: pct != null ? `${pct}%` : "30%" }} />
+        <div className="install-progress">
+          <div
+            className={`progress ${pct == null ? "indeterminate" : ""}`}
+            role="progressbar"
+            aria-label={`${label}. ${activityDetail}`}
+            aria-valuenow={pct ?? undefined}
+            aria-valuemin={pct != null ? 0 : undefined}
+            aria-valuemax={pct != null ? 100 : undefined}
+          >
+            <span style={{ width: pct != null ? `${pct}%` : "32%" }} />
+          </div>
+          <span>Keep this window open and leave the PC connected to power.</span>
         </div>
       )}
       {sha && <p className="mono">{sha}</p>}

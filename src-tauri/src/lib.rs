@@ -6,6 +6,7 @@ mod error;
 mod grub;
 mod iso;
 mod journal;
+mod operation;
 mod partition;
 mod paths;
 mod platform;
@@ -14,6 +15,7 @@ mod winvol;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(operation::OperationGate::default())
         .plugin(tauri_plugin_opener::init())
         .plugin({
             let mut log = tauri_plugin_log::Builder::new()

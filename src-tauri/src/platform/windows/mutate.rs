@@ -3,7 +3,7 @@
 use super::{
     host_info,
     iso_mount::MountedIso,
-    process::{run_storage_powershell, system_command, SystemTool},
+    process::{output_with_timeout, run_storage_powershell, system_command, SystemTool},
     registry::{get_hklm_dword, set_hklm_dword},
 };
 use crate::cidata::{self, CidataIdentity};
@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 use windows::core::w;
 use zip::write::FileOptions;
 use zip::ZipWriter;
@@ -888,7 +889,13 @@ pub fn export_support_bundle() -> Result<PathBuf> {
 }
 
 fn diagnostic_output(tool: SystemTool, args: &[&str]) -> String {
-    match system_command(tool).and_then(|mut command| Ok(command.args(args).output()?)) {
+    match system_command(tool).and_then(|mut command| {
+        output_with_timeout(
+            command.args(args),
+            Duration::from_secs(15),
+            "support-bundle diagnostic",
+        )
+    }) {
         Ok(output) => format!(
             "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code(),

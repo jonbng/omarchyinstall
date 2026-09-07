@@ -23,12 +23,16 @@ export function AbortButton({ onClick }: { onClick: () => void }) {
 export function AbortDialog({
   copy,
   busy,
+  busyMessage,
+  stayDisabled = false,
   error,
   onStay,
   onConfirm,
 }: {
   copy: AbortCopy;
   busy: boolean;
+  busyMessage?: string;
+  stayDisabled?: boolean;
   error: string | null;
   onStay: () => void;
   onConfirm: () => void;
@@ -41,20 +45,27 @@ export function AbortDialog({
     if (!node.open) node.showModal();
     const onCancel = (event: Event) => {
       event.preventDefault();
-      if (!busy) onStay();
+      if (!busy && !stayDisabled) onStay();
     };
     node.addEventListener("cancel", onCancel);
     return () => node.removeEventListener("cancel", onCancel);
-  }, [busy, onStay]);
+  }, [busy, onStay, stayDisabled]);
 
   return (
     <dialog ref={ref} className="abort-dialog" aria-labelledby="abort-title">
       <p className="kicker">{copy.kicker}</p>
       <h2 id="abort-title">{copy.title}</h2>
       <p>{copy.body}</p>
+      {busy && busyMessage && <p className="banner">{busyMessage}</p>}
       {error && <p className="banner error">{error}</p>}
       <div className="abort-actions">
-        <button type="button" className="btn ghost" onClick={onStay} disabled={busy} autoFocus>
+        <button
+          type="button"
+          className="btn ghost"
+          onClick={onStay}
+          disabled={busy || stayDisabled}
+          autoFocus
+        >
           {copy.cancel}
         </button>
         {copy.confirm && (
