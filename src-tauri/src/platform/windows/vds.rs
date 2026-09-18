@@ -56,6 +56,20 @@ pub(crate) fn query_max_reclaimable(volume_guid: &str, mount_path: &str) -> Resu
 }
 
 pub(crate) fn query_report(volume_guid: &str, mount_path: &str) -> Result<ShrinkReport> {
+    for attempt in 1..=2 {
+        match query_report_once(volume_guid, mount_path) {
+            Err(error @ Error::Timeout { .. }) if attempt == 1 => {
+                log::warn!(
+                    "native VDS shrink-capacity query timed out; retrying once in a fresh helper: {error}"
+                );
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded VDS retry loop always returns")
+}
+
+fn query_report_once(volume_guid: &str, mount_path: &str) -> Result<ShrinkReport> {
     let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
     command
@@ -144,13 +158,7 @@ fn query_in_process(target_volume: &str, target_mount: &str) -> Result<u64> {
 
 fn query_initialized(target_volume: &str, target_mount: &str) -> Result<u64> {
     unsafe {
-        struct Candidate {
-            volume: IVdsVolume,
-            guid_matches: bool,
-            access_path_matches: bool,
-        }
-
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<IVdsVolume> = Vec::new();
         let loader: IVdsServiceLoader =
             CoCreateInstance(&CLSID_VdsLoader, None, CLSCTX_LOCAL_SERVER)?;
         let service = loader.LoadService(PCWSTR::null())?;
@@ -187,86 +195,66 @@ fn query_initialized(target_volume: &str, target_mount: &str) -> Result<u64> {
                     let id_name = format!(r"\\?\Volume{{{}}}\", guid_string(properties.id));
                     let guid_matches =
                         same_volume(&name, target_volume) || same_volume(&id_name, target_volume);
-                    let paths = volume
-                        .cast::<IVdsVolumeMF>()
-                        .ok()
-                        .and_then(|volume| query_access_paths(&volume).ok())
-                        .unwrap_or_default();
-                    let access_path_matches = paths
-                        .iter()
-                        .any(|path| same_access_path(path, target_mount));
-                    if guid_matches || access_path_matches {
-                        candidates.push(Candidate {
-                            volume,
-                            guid_matches,
-                            access_path_matches,
-                        });
+                    if guid_matches {
+                        // The native inventory already proved this GUID owns
+                        // target_mount. Return immediately so a slow unrelated
+                        // VDS volume cannot consume the helper's time budget.
+                        return query_candidate(&volume);
                     }
+                    candidates.push(volume);
                 }
             }
         }
 
-        let matches: Vec<(bool, bool)> = candidates
+        // Some providers use a private name rather than the Win32 volume GUID.
+        // Only in that case ask for access paths. QueryAccessPaths can be very
+        // slow on unrelated volumes, so it must not be part of the normal path.
+        let access_matches: Vec<bool> = candidates
             .iter()
-            .map(|candidate| (candidate.guid_matches, candidate.access_path_matches))
+            .map(|volume| {
+                volume
+                    .cast::<IVdsVolumeMF>()
+                    .ok()
+                    .and_then(|volume| query_access_paths(&volume).ok())
+                    .is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| same_access_path(path, target_mount))
+                    })
+            })
             .collect();
-        let (selected, _basis) = select_candidate(&matches, target_volume, target_mount)?;
-        let shrink: IVdsVolumeShrink = candidates[selected].volume.cast().map_err(|error| {
+        let Some(selected) = unique_match(&access_matches, "access path", target_mount)? else {
+            return Err(Error::Message(format!(
+                "VDS did not return Windows volume {target_volume} or access path {target_mount}"
+            )));
+        };
+        return query_candidate(&candidates[selected]);
+    }
+}
+
+fn query_candidate(volume: &IVdsVolume) -> Result<u64> {
+    unsafe {
+        let shrink: IVdsVolumeShrink = volume.cast().map_err(|error| {
             Error::Message(format!(
                 "Windows volume does not expose IVdsVolumeShrink: {error}"
             ))
         })?;
-        return Ok(shrink.QueryMaxReclaimableBytes()?);
+        Ok(shrink.QueryMaxReclaimableBytes()?)
     }
 }
 
-/// Selects one VDS volume without requiring providers to expose a drive-letter
-/// access path. The native inventory has already proved that `target_volume`
-/// owns `target_mount`, so a unique GUID match is authoritative. An access-path
-/// match is useful corroboration and is a safe fallback when VDS uses a
-/// provider-specific volume name. Conflicting or ambiguous matches fail closed.
-fn select_candidate(
-    matches: &[(bool, bool)],
-    target_volume: &str,
-    target_mount: &str,
-) -> Result<(usize, &'static str)> {
-    let both: Vec<usize> = matches
+fn unique_match(matches: &[bool], kind: &str, value: &str) -> Result<Option<usize>> {
+    let mut found = matches
         .iter()
         .enumerate()
-        .filter_map(|(index, (guid, path))| (*guid && *path).then_some(index))
-        .collect();
-    if both.len() == 1 {
-        return Ok((both[0], "volume GUID and access path"));
-    }
-    if both.len() > 1 {
+        .filter_map(|(index, matched)| (*matched).then_some(index));
+    let first = found.next();
+    if found.next().is_some() {
         return Err(Error::Message(format!(
-            "VDS returned multiple volumes matching {target_volume} and {target_mount}"
+            "VDS returned multiple volumes matching {kind} {value}"
         )));
     }
-
-    let guid: Vec<usize> = matches
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (guid, _))| (*guid).then_some(index))
-        .collect();
-    let path: Vec<usize> = matches
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (_, path))| (*path).then_some(index))
-        .collect();
-    match (guid.as_slice(), path.as_slice()) {
-        ([index], []) => Ok((*index, "volume GUID")),
-        ([], [index]) => Ok((*index, "access path")),
-        ([], []) => Err(Error::Message(format!(
-            "VDS did not return Windows volume {target_volume} or access path {target_mount}"
-        ))),
-        ([guid_index], [path_index]) if guid_index != path_index => Err(Error::Message(format!(
-            "VDS volume GUID {target_volume} and access path {target_mount} refer to different volumes"
-        ))),
-        _ => Err(Error::Message(format!(
-            "VDS returned ambiguous matches for volume {target_volume} and access path {target_mount}"
-        ))),
-    }
+    Ok(first)
 }
 
 unsafe fn next_object(enumerator: &IEnumVdsObject) -> Result<Option<windows::core::IUnknown>> {
@@ -374,30 +362,26 @@ mod tests {
     }
 
     #[test]
-    fn candidate_selection_accepts_unique_guid_when_provider_omits_access_path() {
+    fn unique_match_accepts_one_match() {
         assert_eq!(
-            select_candidate(&[(true, false)], "volume", "C:\\").unwrap(),
-            (0, "volume GUID")
+            unique_match(&[false, true], "GUID", "volume").unwrap(),
+            Some(1)
         );
     }
 
     #[test]
-    fn candidate_selection_accepts_corroborated_or_unique_path_match() {
+    fn unique_match_allows_no_match_for_fallback() {
         assert_eq!(
-            select_candidate(&[(false, false), (true, true)], "volume", "C:\\").unwrap(),
-            (1, "volume GUID and access path")
-        );
-        assert_eq!(
-            select_candidate(&[(false, true)], "volume", "C:\\").unwrap(),
-            (0, "access path")
+            unique_match(&[false, false], "GUID", "volume").unwrap(),
+            None
         );
     }
 
     #[test]
-    fn candidate_selection_rejects_conflicting_identity_signals() {
-        let error = select_candidate(&[(true, false), (false, true)], "volume", "C:\\")
+    fn unique_match_rejects_ambiguity() {
+        let error = unique_match(&[true, false, true], "GUID", "volume")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("different volumes"), "{error}");
+        assert!(error.contains("multiple volumes"), "{error}");
     }
 }
