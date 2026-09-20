@@ -8,7 +8,6 @@ mod native_storage;
 mod probe;
 mod process;
 mod registry;
-pub(crate) mod shrink;
 
 use super::{
     BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,

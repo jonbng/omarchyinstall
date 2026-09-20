@@ -4,7 +4,6 @@ use super::{
     native_storage::{self, InventoryEnvelope, NativePartition, NativeStorageReport},
     process::run_storage_powershell_read_only,
     registry::get_hklm_dword,
-    shrink::{self, ShrinkReport},
 };
 use crate::error::{Error, Result};
 use crate::platform::{
@@ -52,8 +51,12 @@ pub(crate) struct NativeProbeDiagnostics {
     pub inventory_envelope: Option<InventoryEnvelope>,
     pub inventory: Option<NativeStorageReport>,
     pub inventory_error: Option<String>,
-    pub shrink: Option<ShrinkReport>,
+    // Kept as null for support-bundle schema compatibility. Running Windows'
+    // shrink-capacity query here can start a defrag analysis that outlives the
+    // probe and blocks later Storage operations.
+    pub shrink: Option<serde_json::Value>,
     pub shrink_error: Option<String>,
+    pub shrink_status: String,
     pub bitlocker: BitlockerDiagnostics,
 }
 
@@ -72,8 +75,8 @@ pub fn probe_machine() -> Result<MachineProbe> {
 pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagnostics)> {
     let probe_started = Instant::now();
     let host = super::host_info()?;
-    // WMI is independent and occasionally slow. Let it overlap the strictly
-    // ordered native inventory -> shrink-capacity query.
+    // WMI is independent and occasionally slow. Let it overlap native storage
+    // inventory so the two read-only checks do not serialize the precheck.
     let bitlocker_thread = std::thread::spawn(query_bitlocker);
     let uefi = is_uefi();
     let secure_boot = secure_boot_enabled();
@@ -103,30 +106,6 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         };
     let tpm_present = tpm_present_tbs();
 
-    let (shrink, shrink_failure) = if let Some(inventory) = &inventory {
-        match shrink::query_report(&inventory.boot_volume_guid, "C:\\") {
-            Ok(report) => {
-                log::info!(
-                    "Windows shrink-capacity query completed in {} ms",
-                    report.elapsed_ms
-                );
-                let failure = report.error.clone().or_else(|| {
-                    report
-                        .max_reclaimable_bytes
-                        .is_none()
-                        .then(|| "Windows returned no shrink capacity.".into())
-                });
-                (Some(report), failure)
-            }
-            Err(error) => {
-                log::warn!("Windows shrink-capacity query failed: {error}");
-                (None, Some(error.to_string()))
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     let bitlocker_diagnostics = bitlocker_thread
         .join()
         .unwrap_or_else(|_| BitlockerDiagnostics {
@@ -138,7 +117,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     let bitlocker_error = bitlocker_diagnostics.error.clone();
     let disks = inventory
         .as_ref()
-        .map(|inventory| disks_from_inventory(inventory, shrink.as_ref()))
+        .map(disks_from_inventory)
         .unwrap_or_default();
     let (mut bitlocker, bitlocker_association_failed) = inventory
         .as_ref()
@@ -177,19 +156,6 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
             component: "BitLocker volume-to-disk association".into(),
             detail: "A BitLocker volume could not be matched to exactly one native volume extent."
                 .into(),
-        });
-    }
-    if inventory.is_some()
-        && shrink
-            .as_ref()
-            .and_then(|report| report.max_reclaimable_bytes)
-            .is_none()
-    {
-        inventory_reasons.push(BlockingReason::ProbeIncomplete {
-            component: "Windows shrink-capacity query".into(),
-            detail: shrink_failure
-                .clone()
-                .unwrap_or_else(|| "Windows returned no result.".into()),
         });
     }
     if inventory.as_ref().is_some_and(|inventory| {
@@ -270,8 +236,9 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         inventory_envelope,
         inventory,
         inventory_error: inventory_failure,
-        shrink,
-        shrink_error: shrink_failure,
+        shrink: None,
+        shrink_error: None,
+        shrink_status: "deferred-to-resize".into(),
         bitlocker: bitlocker_diagnostics,
     };
     Ok((probe::attach_reasons(probe, true), diagnostics))
@@ -490,10 +457,7 @@ fn query_bitlocker() -> BitlockerDiagnostics {
     }
 }
 
-fn disks_from_inventory(
-    inventory: &NativeStorageReport,
-    shrink: Option<&ShrinkReport>,
-) -> Vec<DiskMap> {
+fn disks_from_inventory(inventory: &NativeStorageReport) -> Vec<DiskMap> {
     inventory
         .disks
         .iter()
@@ -524,9 +488,7 @@ fn disks_from_inventory(
                     || identity.to_ascii_lowercase().contains("vmd"),
                 is_dynamic,
                 is_storage_spaces: bus_l == "storagespaces",
-                max_shrink_bytes: (disk.number == inventory.boot_disk_number)
-                    .then(|| shrink.and_then(|report| report.max_reclaimable_bytes))
-                    .flatten(),
+                max_shrink_bytes: None,
                 partitions: disk.partitions.iter().map(partition_from_native).collect(),
             }
         })

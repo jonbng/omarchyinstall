@@ -95,7 +95,7 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
 }
 
 pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
-    let (probe, native_diagnostics) = super::probe::probe_machine_detailed()?;
+    let (probe, _) = super::probe::probe_machine_detailed()?;
     probe::require_complete(&probe)?;
     let existing = load_journal()?;
     let has_started = existing
@@ -141,38 +141,6 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     if let Some(existing) = reuse_prepared(&journal, iso_size) {
         log::info!("prepare: OMARCHYINST and cidata already exist; skip shrink");
         return Ok(existing);
-    }
-    if matches!(
-        journal.step,
-        JournalStep::Planned | JournalStep::PowerPrepared
-    ) {
-        let volume_guid = native_diagnostics
-            .inventory
-            .as_ref()
-            .map(|inventory| inventory.boot_volume_guid.as_str())
-            .ok_or_else(|| {
-                Error::Message(
-                    "native Windows volume identity is unavailable for final shrink validation"
-                        .into(),
-                )
-            })?;
-        let required_shrink = journal
-            .old_c_size_bytes
-            .zip(journal.new_c_size_bytes)
-            .and_then(|(old, new)| old.checked_sub(new))
-            .unwrap_or(hole);
-        let final_shrink = super::shrink::query_max_reclaimable(volume_guid, "C:\\")?
-            .max_reclaimable_bytes
-            .ok_or_else(|| Error::Message("Windows returned no final shrink capacity".into()))?;
-        let required_with_headroom = required_shrink
-            .checked_add(probe::SHRINK_HEADROOM_BYTES)
-            .ok_or_else(|| Error::Message("required shrink capacity overflow".into()))?;
-        if final_shrink < required_with_headroom {
-            return Err(Error::Message(format!(
-                "unmovable files leave only {final_shrink} shrinkable bytes; {required_shrink} bytes plus {} bytes of safety headroom are required",
-                probe::SHRINK_HEADROOM_BYTES
-            )));
-        }
     }
     if journal.target_disk_guid.is_none() {
         let esp = probe
@@ -235,7 +203,7 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
         journal.pending_operation = Some(PendingOperation::ShrinkWindows);
         save_journal(&journal)?;
         run_storage_powershell(&format!(
-            r#"$ErrorActionPreference='Stop'; $d=Get-Disk -Number {disk_number}; if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}; $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}; if (-not $c) {{ throw 'Windows partition disappeared' }}; if ([uint64]$c.Size -eq [uint64]{old_c}) {{ $supported=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber; if ([uint64]{new_c} -lt [uint64]$supported.SizeMin) {{ throw 'unmovable files; Windows will not shrink C: enough' }}; Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{new_c}) }} elseif ([uint64]$c.Size -ne [uint64]{new_c}) {{ throw 'Windows partition size does not match journal' }}; 'ok'"#,
+            r#"$ErrorActionPreference='Stop'; $d=Get-Disk -Number {disk_number}; if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}; $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}; if (-not $c) {{ throw 'Windows partition disappeared' }}; if ([uint64]$c.Size -eq [uint64]{old_c}) {{ try {{ Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{new_c}) -Confirm:$false -ErrorAction Stop }} catch {{ throw "Windows could not shrink C: by the required amount. This is usually caused by too little free space or unmovable NTFS files. Windows reported: $($_.Exception.Message)" }} }} elseif ([uint64]$c.Size -ne [uint64]{new_c}) {{ throw 'Windows partition size does not match journal' }}; 'ok'"#,
             disk_guid = ps_guid(&disk_guid),
             windows_guid = ps_guid(&windows_guid),
         ))?;
@@ -804,7 +772,7 @@ Remove-Staged '{om_guid}' ([uint64]{om_offset}) ([uint64]{om_size}) 'OMARCHYINST
 if ({old_c} -gt 0) {{
   $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}
   if (-not $c) {{ throw 'journaled Windows partition disappeared' }}
-  if ([uint64]$c.Size -lt [uint64]{old_c}) {{ $supported=Get-PartitionSupportedSize -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber; if ([uint64]{old_c} -gt [uint64]$supported.SizeMax) {{ throw 'Windows partition cannot be restored to its old size' }}; Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{old_c}) }}
+  if ([uint64]$c.Size -lt [uint64]{old_c}) {{ Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{old_c}) -Confirm:$false -ErrorAction Stop }}
   elseif ([uint64]$c.Size -ne [uint64]{old_c}) {{ throw 'Windows partition is larger than its journaled original size' }}
 }}
 Write-Output 'ok'
@@ -918,6 +886,7 @@ pub fn export_support_bundle() -> Result<PathBuf> {
                 "inventoryError": error.to_string(),
                 "shrink": null,
                 "shrinkError": null,
+                "shrinkStatus": "deferred-to-resize",
                 "bitlocker": {
                     "elapsedMs": 0,
                     "volumes": [],
@@ -1205,6 +1174,13 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn windows_paths_do_not_preflight_resize_with_supported_size() {
+        let source = include_str!("mutate.rs");
+        let cmdlet = ["Get-Partition", "SupportedSize"].concat();
+        assert!(!source.contains(&cmdlet));
     }
 
     #[test]

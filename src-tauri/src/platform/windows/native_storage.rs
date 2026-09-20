@@ -2,7 +2,6 @@
 
 use super::process::output_with_timeout_in_job;
 use crate::error::{Error, Result};
-use crate::platform::windows::shrink;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -848,8 +847,10 @@ struct StorageSelfTestEnvelope {
     protocol_version: u32,
     inventory: Option<InventoryEnvelope>,
     inventory_error: Option<String>,
-    shrink: Option<shrink::ShrinkReport>,
+    // Compatibility fields for self-test consumers from before v0.4.18.
+    shrink: Option<serde_json::Value>,
     shrink_error: Option<String>,
+    shrink_status: String,
 }
 
 /// Handles the private storage helper protocol before the GUI runtime starts.
@@ -866,22 +867,13 @@ pub fn run_helper_if_requested() -> bool {
             Ok(envelope) => (Some(envelope), None),
             Err(error) => (None, Some(error.to_string())),
         };
-        let (shrink, shrink_error) = match inventory
-            .as_ref()
-            .and_then(|envelope| envelope.report.as_ref())
-        {
-            Some(report) => match shrink::query_report(&report.boot_volume_guid, "C:\\") {
-                Ok(report) => (Some(report), None),
-                Err(error) => (None, Some(error.to_string())),
-            },
-            None => (None, None),
-        };
         serde_json::to_vec(&StorageSelfTestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             inventory,
             inventory_error,
-            shrink,
-            shrink_error,
+            shrink: None,
+            shrink_error: None,
+            shrink_status: "deferred-to-resize".into(),
         })
     } else {
         match args.get(1).map(String::as_str) {

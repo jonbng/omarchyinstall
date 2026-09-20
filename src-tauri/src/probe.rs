@@ -225,6 +225,14 @@ mod tests {
     }
 
     #[test]
+    fn deferred_shrink_capacity_does_not_block_precheck() {
+        let mut p = probe();
+        p.disks[0].max_shrink_bytes = None;
+        let p = attach_reasons(p, true);
+        assert!(p.blocking_reasons.is_empty(), "{:?}", p.blocking_reasons);
+    }
+
+    #[test]
     fn stub_skips_elevation_block() {
         let mut p = probe();
         p.host = host(false, false);

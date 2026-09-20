@@ -1196,7 +1196,7 @@ function DiskCard({ disk, linuxById }: { disk: DiskMap; linuxById: string | null
       <p className="muted">
         {disk.maxShrinkBytes != null
           ? `shrinkable ${formatBytes(disk.maxShrinkBytes)}`
-          : "shrinkable unknown"}
+          : "shrink capacity checked when preparing"}
       </p>
       <div className="disk-bar" aria-hidden="true">
         {disk.partitions.map((p, i) => (
