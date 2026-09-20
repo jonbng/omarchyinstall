@@ -32,7 +32,7 @@ pub const MIB: u64 = 1024 * 1024;
 
 /// Default hole we need to shrink: 8 GiB `OMARCHYINST` + 512 MiB boot/cidata.
 pub const INSTALLER_HOLE_BYTES: u64 = 8 * GIB + 512 * MIB;
-/// Keep a small safety margin for filesystem/VDS changes between precheck and resize.
+/// Keep a small safety margin for filesystem changes between precheck and resize.
 pub const SHRINK_HEADROOM_BYTES: u64 = 64 * MIB;
 
 pub fn ram_ok_for_copytoram(installed: u64, total_phys: u64) -> bool {

@@ -4,7 +4,7 @@ use super::{
     native_storage::{self, InventoryEnvelope, NativePartition, NativeStorageReport},
     process::run_storage_powershell_read_only,
     registry::get_hklm_dword,
-    vds::{self, ShrinkReport},
+    shrink::{self, ShrinkReport},
 };
 use crate::error::{Error, Result};
 use crate::platform::{
@@ -73,7 +73,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     let probe_started = Instant::now();
     let host = super::host_info()?;
     // WMI is independent and occasionally slow. Let it overlap the strictly
-    // ordered native inventory -> VDS target query.
+    // ordered native inventory -> shrink-capacity query.
     let bitlocker_thread = std::thread::spawn(query_bitlocker);
     let uefi = is_uefi();
     let secure_boot = secure_boot_enabled();
@@ -104,22 +104,22 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     let tpm_present = tpm_present_tbs();
 
     let (shrink, shrink_failure) = if let Some(inventory) = &inventory {
-        match vds::query_report(&inventory.boot_volume_guid, "C:\\") {
+        match shrink::query_report(&inventory.boot_volume_guid, "C:\\") {
             Ok(report) => {
                 log::info!(
-                    "native VDS shrink-capacity query completed in {} ms",
+                    "Windows shrink-capacity query completed in {} ms",
                     report.elapsed_ms
                 );
                 let failure = report.error.clone().or_else(|| {
                     report
                         .max_reclaimable_bytes
                         .is_none()
-                        .then(|| "VDS returned no shrink capacity.".into())
+                        .then(|| "Windows returned no shrink capacity.".into())
                 });
                 (Some(report), failure)
             }
             Err(error) => {
-                log::warn!("native VDS shrink-capacity query failed: {error}");
+                log::warn!("Windows shrink-capacity query failed: {error}");
                 (None, Some(error.to_string()))
             }
         }
@@ -186,10 +186,10 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
             .is_none()
     {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
-            component: "native VDS shrink-capacity query".into(),
+            component: "Windows shrink-capacity query".into(),
             detail: shrink_failure
                 .clone()
-                .unwrap_or_else(|| "VDS returned no result.".into()),
+                .unwrap_or_else(|| "Windows returned no result.".into()),
         });
     }
     if inventory.as_ref().is_some_and(|inventory| {

@@ -230,7 +230,7 @@ pub fn run_storage_powershell_read_only(
     timeout: Duration,
     description: &str,
 ) -> Result<String> {
-    let output = output_with_timeout(
+    let output = output_with_timeout_in_job(
         system_command(SystemTool::PowerShell)?.args([
             "-NoProfile",
             "-NonInteractive",

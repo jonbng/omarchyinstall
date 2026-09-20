@@ -2,7 +2,7 @@
 
 use super::process::output_with_timeout_in_job;
 use crate::error::{Error, Result};
-use crate::platform::windows::vds;
+use crate::platform::windows::shrink;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -848,7 +848,7 @@ struct StorageSelfTestEnvelope {
     protocol_version: u32,
     inventory: Option<InventoryEnvelope>,
     inventory_error: Option<String>,
-    shrink: Option<vds::ShrinkReport>,
+    shrink: Option<shrink::ShrinkReport>,
     shrink_error: Option<String>,
 }
 
@@ -870,7 +870,7 @@ pub fn run_helper_if_requested() -> bool {
             .as_ref()
             .and_then(|envelope| envelope.report.as_ref())
         {
-            Some(report) => match vds::query_report(&report.boot_volume_guid, "C:\\") {
+            Some(report) => match shrink::query_report(&report.boot_volume_guid, "C:\\") {
                 Ok(report) => (Some(report), None),
                 Err(error) => (None, Some(error.to_string())),
             },
@@ -887,9 +887,6 @@ pub fn run_helper_if_requested() -> bool {
         match args.get(1).map(String::as_str) {
             Some("inventory") if args.len() == 2 => {
                 serde_json::to_vec(&inventory_envelope_in_process())
-            }
-            Some("shrink") if args.len() == 4 => {
-                serde_json::to_vec(&vds::query_report_in_process(&args[2], &args[3]))
             }
             _ => serde_json::to_vec(&InventoryEnvelope {
                 protocol_version: PROTOCOL_VERSION,

@@ -161,9 +161,9 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
             .zip(journal.new_c_size_bytes)
             .and_then(|(old, new)| old.checked_sub(new))
             .unwrap_or(hole);
-        let final_shrink = super::vds::query_max_reclaimable(volume_guid, "C:\\")?
+        let final_shrink = super::shrink::query_max_reclaimable(volume_guid, "C:\\")?
             .max_reclaimable_bytes
-            .ok_or_else(|| Error::Message("VDS returned no final shrink capacity".into()))?;
+            .ok_or_else(|| Error::Message("Windows returned no final shrink capacity".into()))?;
         let required_with_headroom = required_shrink
             .checked_add(probe::SHRINK_HEADROOM_BYTES)
             .ok_or_else(|| Error::Message("required shrink capacity overflow".into()))?;
