@@ -1,6 +1,12 @@
 //! Secure loopback UI used when the native WebView cannot be created.
 
-use crate::{cidata::CidataIdentity, download, operation::OperationGate, platform};
+use crate::{
+    cidata::CidataIdentity,
+    download,
+    operation::OperationGate,
+    platform,
+    workflow::{InstallProgress, InstallRequest},
+};
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -31,10 +37,17 @@ struct BrowserState {
     assets: Arc<tauri::AssetResolver<tauri::Wry>>,
     origin: Arc<str>,
     token: Arc<str>,
-    events: broadcast::Sender<download::IsoProgress>,
+    events: broadcast::Sender<BrowserEvent>,
     operation: OperationGate,
     last_seen: Arc<Mutex<Instant>>,
     active: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "camelCase")]
+enum BrowserEvent {
+    Iso(download::IsoProgress),
+    Install(InstallProgress),
 }
 
 struct ActiveGuard(Arc<AtomicUsize>);
@@ -222,16 +235,26 @@ async fn events(State(state): State<BrowserState>, headers: HeaderMap) -> Respon
 }
 
 fn event_stream(
-    receiver: broadcast::Receiver<download::IsoProgress>,
+    receiver: broadcast::Receiver<BrowserEvent>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(receiver, |mut receiver| async move {
         loop {
             match receiver.recv().await {
-                Ok(progress) => {
+                Ok(message) => {
+                    let (name, payload) = match message {
+                        BrowserEvent::Iso(progress) => (
+                            "iso://progress",
+                            serde_json::to_value(progress).expect("ISO progress serializes"),
+                        ),
+                        BrowserEvent::Install(progress) => (
+                            "install://progress",
+                            serde_json::to_value(progress).expect("install progress serializes"),
+                        ),
+                    };
                     let event = Event::default()
-                        .event("iso://progress")
-                        .json_data(progress)
-                        .expect("ISO progress serializes");
+                        .event(name)
+                        .json_data(payload)
+                        .expect("browser event serializes");
                     return Some((Ok(event), receiver));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -314,6 +337,10 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
                 .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
         }
         "load_install_state" => blocking!(platform::load_install_state()),
+        "assess_install_recovery" => {
+            let _operation = state.operation.lock().await;
+            blocking!(platform::assess_install_recovery())
+        }
         "relaunch_elevated" => {
             let _operation = state.operation.lock().await;
             blocking!(platform::relaunch_elevated())
@@ -326,12 +353,12 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             let tx = state.events.clone();
             if download::stub_skips_iso() {
                 download::skip_iso_download(move |progress| {
-                    let _ = tx.send(progress);
+                    let _ = tx.send(BrowserEvent::Iso(progress));
                 })
                 .await
             } else {
                 download::download_iso_files(move |progress| {
-                    let _ = tx.send(progress);
+                    let _ = tx.send(BrowserEvent::Iso(progress));
                 })
                 .await
                 .map(|_| ())
@@ -356,42 +383,76 @@ async fn run_command(state: &BrowserState, command: &str, args: Value) -> Result
             let tx = state.events.clone();
             blocking!(if download::stub_skips_iso() {
                 download::skip_iso_verify(move |progress| {
-                    let _ = tx.send(progress);
+                    let _ = tx.send(BrowserEvent::Iso(progress));
                 })
             } else {
                 download::verify_iso_files(move |progress| {
-                    let _ = tx.send(progress);
+                    let _ = tx.send(BrowserEvent::Iso(progress));
                 })
             })
         }
-        "prepare_installer_partition" => {
+        "preview_install_plan" => {
             let _operation = state.operation.lock().await;
             let allow_bitlocker = args
                 .get("allowBitlocker")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            blocking!(platform::prepare_installer_partition(allow_bitlocker))
+            let iso_sha256 = args
+                .get("isoSha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "isoSha256 is required".to_string())?
+                .to_string();
+            let iso_size_bytes = args
+                .get("isoSizeBytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "isoSizeBytes is required".to_string())?;
+            blocking!(platform::preview_install_plan(
+                allow_bitlocker,
+                iso_sha256,
+                iso_size_bytes
+            ))
         }
-        "stage_bootloader" => {
-            let _operation = state.operation.lock().await;
-            blocking!(platform::stage_bootloader())
-        }
-        "write_cidata" => {
-            let _operation = state.operation.lock().await;
+        "execute_install" => {
+            let control = state.operation.clone();
+            let _operation = control.lock().await;
+            control.reset_cancellation();
             let identity: CidataIdentity =
                 serde_json::from_value(args.get("identity").cloned().unwrap_or(Value::Null))
                     .map_err(|e| format!("identity: {e}"))?;
-            blocking!(platform::write_cidata(identity))
-        }
-        "set_boot_next" => {
-            let _operation = state.operation.lock().await;
-            blocking!(platform::set_boot_next())
+            let allow_bitlocker = args
+                .get("allowBitlocker")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let iso_sha256 = args
+                .get("isoSha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "isoSha256 is required".to_string())?
+                .to_string();
+            let approved_plan_digest = args
+                .get("approvedPlanDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "approvedPlanDigest is required".to_string())?
+                .to_string();
+            let tx = state.events.clone();
+            blocking!(crate::workflow::execute(
+                InstallRequest {
+                    identity,
+                    allow_bitlocker,
+                    iso_sha256,
+                    approved_plan_digest,
+                },
+                move |progress| {
+                    let _ = tx.send(BrowserEvent::Install(progress));
+                },
+                move || control.cancellation_requested(),
+            ))
         }
         "reboot_to_installer" => {
             let _operation = state.operation.lock().await;
             blocking!(platform::reboot_to_installer())
         }
         "abort_and_rollback" => {
+            state.operation.request_cancellation();
             let _operation = state.operation.lock().await;
             blocking!(platform::abort_and_rollback())
         }

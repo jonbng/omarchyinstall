@@ -183,6 +183,12 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .review-grid dd { min-width: 0; }
 .review-grid > :nth-last-child(-n + 2) { border-bottom: 0; }
 .review-details { margin-bottom: 1rem; }
+.review-verification { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line); background: rgb(var(--rgb-storm) / .42); font-variant-numeric: tabular-nums; }
+.review-verification .progress { margin-top: .8rem; }
+.review-verification small { display: block; margin-top: .6rem; color: var(--muted); font-size: .68rem; }
+.plan-summary { margin-top: 1rem; }
+.plan-summary > .kicker { margin-bottom: .5rem; }
+.technical-details .mono { overflow-wrap: anywhere; }
 .iso-source { display: flex; justify-content: space-between; align-items: center; gap: 1rem; min-width: 0; padding: .6rem 0; }
 .iso-source > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .74rem; }
 .media-digest { margin: 0 0 .8rem; color: var(--muted); }
@@ -196,6 +202,7 @@ h1 { margin: 0; font-size: clamp(1.75rem, 3.8vw, 3rem); line-height: 1.12; lette
 .check input { width: 1rem; height: 1rem; flex: none; accent-color: var(--green); }
 .final-check { margin-top: .8rem; opacity: .45; transition: opacity 180ms var(--ease-out); }
 .final-check.visible { opacity: 1; }
+.review-approve { width: 100%; margin-top: 1rem; }
 .copy h2 { margin: 0; font-size: 1.35rem; letter-spacing: -.025em; }
 .copy > p { color: rgb(var(--rgb-white) / .76); }
 .install-heading { min-height: 3rem; display: flex; align-items: center; gap: .9rem; }

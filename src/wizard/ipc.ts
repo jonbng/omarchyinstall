@@ -78,6 +78,7 @@ export function installStartFromJournal(step: string | undefined): InstallStart 
     case "bootNextSet":
       return "done";
     case "bootEntryCreated":
+    case "cidataWritten":
       return "bootnext";
     case "staged":
       return "cidata";

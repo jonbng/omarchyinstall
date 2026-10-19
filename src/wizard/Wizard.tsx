@@ -3,12 +3,16 @@ import type {
   CidataIdentity,
   DiskMap,
   IsoProgress,
+  InstallPlanPreview,
+  InstallProgress,
   MachineProbe,
   PartitionMap,
+  RecoveryAssessment,
   StateJournal,
   VerifyResult,
 } from "../types";
 import { INSTALLER_HOLE_BYTES } from "../types";
+import packageMetadata from "../../package.json";
 import {
   abortCopy,
   abortKind,
@@ -90,7 +94,6 @@ const STEP_SLUG: Record<Step, string> = {
 };
 
 const INSTALL_PHASES = [
-  { id: "verify", label: "Recheck installation media" },
   { id: "prepare", label: "Create installer partitions" },
   { id: "stage", label: "Copy ISO and stage bootloader" },
   { id: "cidata", label: "Write autoinstall configuration" },
@@ -129,19 +132,22 @@ export default function Wizard() {
   const [setupQuestion, setSetupQuestion] = useState(0);
   const [eraseInput, setEraseInput] = useState("");
   const [secondConfirm, setSecondConfirm] = useState(false);
+  const [approvedPlan, setApprovedPlan] = useState<InstallPlanPreview | null>(null);
   const [bitlockerRiskAccepted, setBitlockerRiskAccepted] = useState(false);
   const iso = useIsoAcquisition();
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [journal, setJournal] = useState<StateJournal | null>(null);
   const [installPhase, setInstallPhase] = useState("idle");
+  const [installRecoveryDisposition, setInstallRecoveryDisposition] =
+    useState<RecoveryAssessment["disposition"] | null>(null);
   const [installReady, setInstallReady] = useState(false);
   const [rebooting, setRebooting] = useState(false);
   const [abortOpen, setAbortOpen] = useState(false);
   const [abortBusy, setAbortBusy] = useState(false);
   const [abortError, setAbortError] = useState<string | null>(null);
   const abortRequested = useRef(false);
-  const [version, setVersion] = useState("0.4.17");
+  const [version, setVersion] = useState(packageMetadata.version);
   const [bridgeStatus, setBridgeStatus] = useState<"connected" | "disconnected">("connected");
   const allowClose = useRef(false);
 
@@ -209,20 +215,20 @@ export default function Wizard() {
   const bitlockerActive =
     probe?.bitlocker.some((volume) => !volume.fullyDecrypted) ?? false;
   const native = probe?.host.nativeWindows ?? false;
-  const identityOk = identityFieldsOk(
-    identity.username,
-    identity.hostname,
-    identity.password,
-    password2,
-  );
   const configurationOk =
-    identityOk &&
+    identityFieldsOk(
+      identity.username,
+      identity.hostname,
+      identity.password,
+      password2,
+    ) &&
     fullNameError(identity.fullName) == null &&
     emailError(identity.email) == null &&
-    KEYBOARDS.some((keyboard) => keyboard.id === identity.keyboard) &&
-    KEYBOARDS.some((keyboard) => keyboard.id === identity.keyboard && keyboard.label === keyboardLabel) &&
+    KEYBOARDS.some(
+      (keyboard) =>
+        keyboard.id === identity.keyboard && keyboard.label === keyboardLabel,
+    ) &&
     TIMEZONES.includes(identity.timezone);
-  const eraseOk = eraseInput.trim() === ERASE_PHRASE;
   const isoReady = iso.state.phase === "ready";
 
   const index = STEPS.indexOf(step);
@@ -256,16 +262,17 @@ export default function Wizard() {
       case "Setup":
         return setupQuestionOk;
       case "Review":
-        return isoReady && configurationOk && eraseOk && secondConfirm;
+        return false;
       case "Install":
         return false;
     }
-  }, [step, probe, blocked, probing, bitlockerActive, bitlockerRiskAccepted, setupQuestionOk, iso.state.phase, isoReady, configurationOk, eraseOk, secondConfirm]);
+  }, [step, probe, blocked, probing, bitlockerActive, bitlockerRiskAccepted, setupQuestionOk, iso.state.phase]);
 
   function goTo(name: Step) {
     const next = STEPS.indexOf(name);
     if (next < 0 || next >= index) return;
     setSecondConfirm(false);
+    setApprovedPlan(null);
     if (name === "Setup") setSetupQuestion(0);
     setStep(name);
   }
@@ -381,20 +388,21 @@ export default function Wizard() {
         : iso.state.phase === "error"
           ? "Retry & continue"
           : "Begin installation"
-      : step === "Review"
-        ? isoReady ? "Verify ISO & prepare Omarchy" : "Waiting for installation media…"
-        : step === "Setup" && setupQuestion === SETUP_QUESTIONS.length - 1
+      : step === "Setup" && setupQuestion === SETUP_QUESTIONS.length - 1
           ? "Review installation"
           : "Next";
 
-  const kind = abortKind({
-    step,
-    native,
-    journal,
-    phase: installPhase,
-    ready: installReady,
-    rebooting,
-  });
+  const kind =
+    installRecoveryDisposition === "manualReconciliationRequired"
+      ? "quit"
+      : abortKind({
+          step,
+          native,
+          journal,
+          phase: installPhase,
+          ready: installReady,
+          rebooting,
+        });
   const abort = abortCopy(kind, native);
 
   async function confirmAbort() {
@@ -451,6 +459,7 @@ export default function Wizard() {
 
   function handleMediaInvalid(error: string) {
     clearDestructiveConfirmation();
+    setApprovedPlan(null);
     iso.invalidate(error);
     setStep("Review");
   }
@@ -576,7 +585,7 @@ export default function Wizard() {
             <MediaWaitStep state={iso.state} onRetry={() => void iso.start()} />
           )}
           {step === "Review" && isoReady && (
-            <ConfirmStep
+            <ReviewStep
               probe={probe}
               identity={identity}
               keyboardLabel={keyboardLabel}
@@ -586,6 +595,13 @@ export default function Wizard() {
               onSecondConfirm={setSecondConfirm}
               media={iso.state}
               bitlockerActive={bitlockerActive}
+              configurationOk={configurationOk}
+              allowBitlocker={bitlockerActive && bitlockerRiskAccepted}
+              onMediaInvalid={handleMediaInvalid}
+              onApprove={(plan) => {
+                setApprovedPlan(plan);
+                setStep("Install");
+              }}
             />
           )}
           {step === "Install" && (
@@ -598,6 +614,7 @@ export default function Wizard() {
               onStatus={(next) => {
                 setInstallPhase(next.phase);
                 setInstallReady(next.ready);
+                setInstallRecoveryDisposition(next.recoveryDisposition);
                 if (next.rebooting) setRebooting(true);
               }}
               onJournal={setJournal}
@@ -607,6 +624,7 @@ export default function Wizard() {
               }}
               onUndo={() => undoStaging()}
               onMediaInvalid={handleMediaInvalid}
+              approvedPlan={approvedPlan}
             />
           )}
         </div>
@@ -636,10 +654,10 @@ export default function Wizard() {
               : "No USB drive needed"}
           </span>
         )}
-        {step !== "Install" && !(step === "Review" && !isoReady) && (
+        {step !== "Install" && step !== "Review" && (
           <button
             type="button"
-            className={`btn ${step === "Review" ? "danger" : "primary"}`}
+            className="btn primary"
             onClick={goNext}
             disabled={!canContinue}
           >
@@ -1401,7 +1419,7 @@ function SetupStep({
   );
 }
 
-function ConfirmStep({
+function ReviewStep({
   probe,
   identity,
   keyboardLabel,
@@ -1411,6 +1429,10 @@ function ConfirmStep({
   onSecondConfirm,
   media,
   bitlockerActive,
+  configurationOk,
+  allowBitlocker,
+  onMediaInvalid,
+  onApprove,
 }: {
   probe: MachineProbe | null;
   identity: CidataIdentity;
@@ -1421,17 +1443,70 @@ function ConfirmStep({
   onSecondConfirm: (v: boolean) => void;
   media: IsoAcquisitionState;
   bitlockerActive: boolean;
+  configurationOk: boolean;
+  allowBitlocker: boolean;
+  onMediaInvalid: (error: string) => void;
+  onApprove: (plan: InstallPlanPreview) => void;
 }) {
   const disk =
     probe?.disks.find((d) => d.deviceId === probe.recommendedDiskId) ??
     probe?.disks.find((d) => d.isBoot);
   const matched = eraseInput.trim() === ERASE_PHRASE;
+  const [planPreview, setPlanPreview] = useState<InstallPlanPreview | null>(null);
+  const [bytes, setBytes] = useState(0);
+  const [total, setTotal] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    setPlanPreview(null);
+    setError(null);
+    setBytes(0);
+    setTotal(null);
+    onEraseInput("");
+    onSecondConfirm(false);
+
+    void (async () => {
+      unlisten = await listen<IsoProgress>("iso://progress", (event) => {
+        if (cancelled) return;
+        setBytes(event.payload.bytes);
+        setTotal(event.payload.total);
+      });
+      try {
+        const result = await invoke<VerifyResult>("verify_iso");
+        if (cancelled) return;
+        setBytes(result.bytes);
+        setTotal(result.bytes);
+        const preview = await invoke<InstallPlanPreview>("preview_install_plan", {
+          allowBitlocker,
+          isoSha256: result.sha256,
+          isoSizeBytes: result.bytes,
+        });
+        if (!cancelled) setPlanPreview(preview);
+      } catch (err: unknown) {
+        if (!cancelled) setError(invokeError(err));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [allowBitlocker, retry, onEraseInput, onSecondConfirm]);
+
+  const pct = total && total > 0
+    ? Math.min(100, Math.round((bytes / total) * 100))
+    : null;
 
   return (
     <div className="review">
       <p className="kicker">Ready to install</p>
       <h1>Review your setup</h1>
-      <p className="review-lead">Omarchy will replace Windows on this PC.</p>
+      <p className="review-lead">
+        Check the setup and exact disk plan before Omarchy replaces Windows on this PC.
+      </p>
       {bitlockerActive && (
         <p className="banner">
           BitLocker is still on. Keep your recovery key nearby.
@@ -1452,7 +1527,7 @@ function ConfirmStep({
         <dd>{keyboardLabel}</dd>
         <dt>Install media</dt>
         <dd>
-          {isoSourceName(media.source)} · <span>verification runs before disk changes</span>
+          {isoSourceName(media.source)} · <span>{planPreview ? "verified" : "verifying now"}</span>
         </dd>
         <dt>Git</dt>
         <dd>
@@ -1467,38 +1542,123 @@ function ConfirmStep({
           <span className={media.source.kind === "local" ? "mono" : undefined}>
             {media.source.kind === "local" ? media.source.path : isoSourceName(media.source)}
           </span>
-          <span>{media.total ? `${formatBytes(media.total)} · verification deferred` : "Verification deferred"}</span>
+          <span>{media.total ? formatBytes(media.total) : "Size unavailable"}</span>
         </div>
         {disk && <DiskCard disk={disk} linuxById={probe?.linuxById ?? null} />}
       </details>
 
-      <div className="danger-zone">
-        <strong>Everything on the Windows disk will be erased.</strong>
-        <p>Back up anything you want to keep, then type <b>{ERASE_PHRASE}</b>.</p>
-        <label className="confirm-field">
-          <span className="sr-only">Type {ERASE_PHRASE}</span>
-        <input
-          className={`confirm-input ${matched ? "match" : ""}`}
-          value={eraseInput}
-          onChange={(e) => {
-            onEraseInput(e.target.value);
-            onSecondConfirm(false);
-          }}
-          placeholder={ERASE_PHRASE}
-          autoComplete="off"
-          spellCheck={false}
-        />
-        </label>
-        <label className={`check final-check ${matched ? "visible" : ""}`}>
-          <input
-            type="checkbox"
-            checked={secondConfirm}
-            disabled={!matched}
-            onChange={(e) => onSecondConfirm(e.target.checked)}
-          />
-          My files are backed up and I understand this cannot be undone.
-        </label>
-      </div>
+      {!planPreview && !error && (
+        <div className="review-verification" role="status" aria-live="polite">
+          <div className="install-heading">
+            <span className="install-spinner" aria-hidden="true" />
+            <div>
+              <strong>Verifying ISO and building the disk plan</strong>
+              <p>{pct == null ? "Reading and checking the installation media" : `${formatBytes(bytes)} of ${formatBytes(total ?? 0)} · ${pct}%`}</p>
+            </div>
+          </div>
+          <div className={`progress ${pct == null ? "indeterminate" : ""}`}>
+            <span style={{ width: pct != null ? `${pct}%` : "32%" }} />
+          </div>
+          <small>No disk changes are made during this check.</small>
+        </div>
+      )}
+
+      {error && (
+        <div className="review-verification">
+          <p className="banner error">{error}</p>
+          <div className="actions">
+            <button type="button" className="btn primary" onClick={() => setRetry((n) => n + 1)}>
+              Retry verification
+            </button>
+            <button type="button" className="btn ghost" onClick={() => onMediaInvalid(error)}>
+              Change installation media
+            </button>
+          </div>
+        </div>
+      )}
+
+      {planPreview && (
+        <>
+          <div className="plan-summary">
+            <p className="kicker">Verified disk plan</p>
+            <dl className="review-grid">
+              <dt>Windows C:</dt>
+              <dd>{formatBytes(planPreview.plan.oldCSizeBytes)} → {formatBytes(planPreview.plan.newCSizeBytes)}</dd>
+              <dt>Installer</dt>
+              <dd>{formatBytes(planPreview.plan.omarchyinstSizeBytes)} temporary installer partition</dd>
+              <dt>Autoinstall</dt>
+              <dd>{formatBytes(planPreview.plan.cidataSizeBytes)} configuration partition</dd>
+              <dt>Next boot</dt>
+              <dd>One-time Omarchy installer via UEFI</dd>
+            </dl>
+          </div>
+          <details className="optional review-details technical-details">
+            <summary>Technical plan details</summary>
+            <dl className="review-grid">
+              <dt>Disk</dt>
+              <dd className="mono">#{planPreview.plan.targetDiskNumber} · {planPreview.plan.targetDiskDeviceId}<br />{planPreview.plan.targetDiskGuid}</dd>
+              <dt>Windows</dt>
+              <dd className="mono">{planPreview.plan.windowsPartitionGuid}</dd>
+              <dt>Installer</dt>
+              <dd className="mono">offset {formatBytes(planPreview.plan.omarchyinstOffsetBytes)}</dd>
+              <dt>cidata</dt>
+              <dd className="mono">offset {formatBytes(planPreview.plan.cidataOffsetBytes)}</dd>
+              <dt>ESP</dt>
+              <dd className="mono">{planPreview.plan.espPartitionGuid}<br />{planPreview.plan.espVolumeGuid}</dd>
+              <dt>Linux target</dt>
+              <dd className="mono">{planPreview.plan.linuxDevice}</dd>
+              <dt>ISO SHA-256</dt>
+              <dd className="mono">{planPreview.plan.isoSha256}</dd>
+              <dt>Plan digest</dt>
+              <dd className="mono">{planPreview.digest}</dd>
+            </dl>
+          </details>
+
+          <div className="danger-zone">
+            {!configurationOk && (
+              <p className="banner error">
+                Return to Setup and finish the required fields before installing.
+              </p>
+            )}
+            <strong>Everything on the Windows disk will be erased.</strong>
+            <p>
+              This is the only approval step. Back up anything you want to keep,
+              then type <b>{ERASE_PHRASE}</b>.
+            </p>
+            <label className="confirm-field">
+              <span className="sr-only">Type {ERASE_PHRASE}</span>
+              <input
+                className={`confirm-input ${matched ? "match" : ""}`}
+                value={eraseInput}
+                onChange={(e) => {
+                  onEraseInput(e.target.value);
+                  onSecondConfirm(false);
+                }}
+                placeholder={ERASE_PHRASE}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <label className={`check final-check ${matched ? "visible" : ""}`}>
+              <input
+                type="checkbox"
+                checked={secondConfirm}
+                disabled={!matched}
+                onChange={(e) => onSecondConfirm(e.target.checked)}
+              />
+              My files are backed up and I understand this cannot be undone.
+            </label>
+            <button
+              type="button"
+              className="btn danger review-approve"
+              disabled={!configurationOk || !matched || !secondConfirm}
+              onClick={() => onApprove(planPreview)}
+            >
+              Erase Windows and begin installation
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1543,22 +1703,26 @@ function MutateStep({
   onClearPassword,
   onUndo,
   onMediaInvalid,
+  approvedPlan,
 }: {
   native: boolean;
   identity: CidataIdentity;
   journal: StateJournal | null;
   allowBitlocker: boolean;
   abortRequested: { current: boolean };
-  onStatus: (next: { phase: string; ready: boolean; rebooting: boolean }) => void;
+  onStatus: (next: {
+    phase: string;
+    ready: boolean;
+    rebooting: boolean;
+    recoveryDisposition: RecoveryAssessment["disposition"] | null;
+  }) => void;
   onJournal: (next: StateJournal | null) => void;
   onClearPassword: () => void;
   onUndo: () => Promise<void>;
   onMediaInvalid: (error: string) => void;
+  approvedPlan: InstallPlanPreview | null;
 }) {
-  const [phase, setPhase] = useState<string>("working");
-  const [bytes, setBytes] = useState(0);
-  const [total, setTotal] = useState<number | null>(null);
-  const [sha, setSha] = useState<string | null>(null);
+  const [phase, setPhase] = useState<string>("prepare");
   const [error, setError] = useState<string | null>(null);
   const [windowsOnly, setWindowsOnly] = useState(false);
   const [ready, setReady] = useState(false);
@@ -1567,6 +1731,9 @@ function MutateStep({
   const [busyAction, setBusyAction] = useState(false);
   const [bundlePath, setBundlePath] = useState<string | null>(null);
   const [mediaInvalid, setMediaInvalid] = useState(false);
+  const [planPreview] = useState<InstallPlanPreview | null>(approvedPlan);
+  const [approvedPlanDigest] = useState<string | null>(approvedPlan?.digest ?? null);
+  const [recovery, setRecovery] = useState<RecoveryAssessment | null>(null);
   const onStatusRef = useRef(onStatus);
   onStatusRef.current = onStatus;
   const identityRef = useRef(identity);
@@ -1579,131 +1746,138 @@ function MutateStep({
   onMediaInvalidRef.current = onMediaInvalid;
 
   useEffect(() => {
-    onStatusRef.current({ phase, ready, rebooting });
-  }, [phase, ready, rebooting]);
+    onStatusRef.current({
+      phase,
+      ready,
+      rebooting,
+      recoveryDisposition: recovery?.disposition ?? null,
+    });
+  }, [phase, ready, rebooting, recovery]);
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenInstall: (() => void) | undefined;
 
     void (async () => {
-      unlisten = await listen<IsoProgress>("iso://progress", (event) => {
+      unlistenInstall = await listen<InstallProgress>("install://progress", (event) => {
         if (cancelled || abortRequested.current) return;
-        setPhase("verify");
-        setBytes(event.payload.bytes);
-        setTotal(event.payload.total);
+        setPhase(event.payload.phase);
+        if (event.payload.status === "failed" && event.payload.detail) {
+          setError(event.payload.detail);
+        }
       });
-      let checkingMedia = false;
       try {
         setError(null);
         setMediaInvalid(false);
         setWindowsOnly(false);
         setReady(false);
         setBundlePath(null);
+        setRecovery(null);
         const current =
           (await invoke<StateJournal | null>("load_install_state").catch(() => null)) ?? journal;
         if (cancelled || abortRequested.current) return;
         if (current) onJournalRef.current(current);
+        const assessment = await invoke<RecoveryAssessment>("assess_install_recovery");
+        if (cancelled || abortRequested.current) return;
+        setRecovery(assessment);
+        if (
+          assessment.disposition === "manualReconciliationRequired" ||
+          assessment.disposition === "rollbackRequired"
+        ) {
+          setPhase(installStartFromJournal(current?.step));
+          setError(assessment.reason);
+          return;
+        }
         const start = installStartFromJournal(current?.step);
-        if (start === "done") {
+        if (assessment.disposition === "completed" || start === "done") {
           setPhase("done");
           setReady(true);
           return;
         }
-        if (start === "cidata" && identityRef.current.password.length < 1) {
+        const resumeNeedsIdentity =
+          current != null &&
+          !["cidataWritten", "bootEntryCreated", "bootNextSet"].includes(current.step);
+        if (resumeNeedsIdentity && identityRef.current.password.length < 1) {
           setError("Re-enter the user password in Setup, then retry.");
-          setPhase("cidata");
+          setPhase(start);
           return;
         }
-        if (start === "prepare") {
-          checkingMedia = true;
-          setPhase("verify");
-          const result = await invoke<VerifyResult>("verify_iso");
-          if (cancelled || abortRequested.current) return;
-          checkingMedia = false;
-          setSha(result.sha256);
-          setBytes(result.bytes);
-          setTotal(result.bytes);
-          setPhase("prepare");
-          await invoke("prepare_installer_partition", { allowBitlocker });
-          if (cancelled || abortRequested.current) return;
+        let executionDigest = current?.planDigest ?? "";
+        let executionIsoSha256 = current?.isoSha256 ?? "";
+        const needsPlan =
+          !executionDigest && (!current || current.step === "planned");
+        if (needsPlan) {
+          if (!planPreview || approvedPlanDigest !== planPreview.digest) {
+            setPhase("stopped");
+            setError("The approved install plan is missing. Return to Review and approve it again.");
+            return;
+          }
+          executionDigest = planPreview.digest;
+          executionIsoSha256 = planPreview.plan.isoSha256;
         }
-        if (start === "prepare" || start === "stage") {
-          setPhase("stage");
-          await invoke("stage_bootloader");
-          if (cancelled || abortRequested.current) return;
-        }
-        if (start === "prepare" || start === "stage" || start === "cidata") {
-          setPhase("cidata");
-          await invoke("write_cidata", { identity: identityRef.current });
-          if (cancelled || abortRequested.current) return;
-        }
-        setPhase("bootnext");
-        await invoke("set_boot_next");
+        const next = await invoke<StateJournal>("execute_install", {
+          identity: identityRef.current,
+          allowBitlocker,
+          isoSha256: executionIsoSha256,
+          approvedPlanDigest: executionDigest,
+        });
         if (cancelled || abortRequested.current) return;
-        const next = await invoke<StateJournal | null>("load_install_state").catch(() => null);
-        if (next) onJournalRef.current(next);
+        onJournalRef.current(next);
         onClearPasswordRef.current();
         setPhase("done");
         setReady(true);
       } catch (err: unknown) {
         if (cancelled || abortRequested.current) return;
         const message = invokeError(err);
+        const afterFailure = await invoke<RecoveryAssessment>("assess_install_recovery")
+          .catch(() => null);
+        if (cancelled || abortRequested.current) return;
+        if (afterFailure) setRecovery(afterFailure);
+        const nextJournal = await invoke<StateJournal | null>("load_install_state")
+          .catch(() => null);
+        if (nextJournal) onJournalRef.current(nextJournal);
         if (message.toLowerCase().includes("only available on windows")) {
           setWindowsOnly(true);
           setPhase("prepare");
         } else {
           setError(message);
-          setMediaInvalid(checkingMedia);
+          setMediaInvalid(false);
         }
       }
     })();
 
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlistenInstall?.();
     };
     // Identity is read through a ref; retry is `tick`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, allowBitlocker]);
 
-  // Only verification reports byte progress. Later phases must remain
-  // indeterminate instead of reusing the completed verification percentage.
-  const pct =
-    phase === "verify" && total && total > 0
-      ? Math.min(100, Math.round((bytes / total) * 100))
-      : null;
   const label =
-    phase === "verify"
-      ? "Verifying installation media"
-      : phase === "prepare"
-            ? "Creating installer partitions"
-            : phase === "stage"
-              ? "Planting GRUB on the ESP"
-              : phase === "cidata"
-                ? "Writing autoinstall cidata"
-                : phase === "bootnext"
-                  ? "Setting one-shot BootNext"
-                  : phase === "done" && ready
-                    ? "Ready to reboot into Omarchy"
-                    : windowsOnly
-                      ? "ISO verified — disk staging is Windows-only"
-                      : error
-                        ? "Staging failed"
-                        : "Starting…";
+    phase === "prepare"
+      ? "Creating installer partitions"
+      : phase === "stage"
+        ? "Planting GRUB on the ESP"
+        : phase === "cidata"
+          ? "Writing autoinstall cidata"
+          : phase === "bootnext"
+            ? "Setting one-shot BootNext"
+            : phase === "done" && ready
+              ? "Ready to reboot into Omarchy"
+              : windowsOnly
+                ? "Disk staging is Windows-only"
+                : error
+                  ? "Staging failed"
+                  : "Starting…";
 
   const working =
     !error &&
     !ready &&
     !windowsOnly &&
-    phase !== "idle" &&
-    phase !== "stopped";
+    phase !== "idle" && phase !== "stopped";
   const activityDetail =
-    phase === "verify"
-      ? pct != null
-        ? `${formatBytes(bytes)} of ${formatBytes(total ?? 0)} · ${pct}%`
-        : "Reading and checking the ISO"
-      : phase === "prepare"
+    phase === "prepare"
         ? "Windows may take several minutes to resize the disk"
         : phase === "stage"
           ? "Copying the ISO and installer files"
@@ -1734,9 +1908,7 @@ function MutateStep({
                 {state === "ok"
                   ? "Done"
                   : state === "run"
-                    ? item.id === "verify" && pct != null
-                      ? `${pct}%`
-                      : "Working…"
+                    ? "Working…"
                     : state === "fail"
                       ? "Failed"
                       : state === "skip"
@@ -1750,19 +1922,17 @@ function MutateStep({
       {working && (
         <div className="install-progress">
           <div
-            className={`progress ${pct == null ? "indeterminate" : ""}`}
+            className="progress indeterminate"
             role="progressbar"
             aria-label={`${label}. ${activityDetail}`}
-            aria-valuenow={pct ?? undefined}
-            aria-valuemin={pct != null ? 0 : undefined}
-            aria-valuemax={pct != null ? 100 : undefined}
+            aria-valuemin={0}
+            aria-valuemax={100}
           >
-            <span style={{ width: pct != null ? `${pct}%` : "32%" }} />
+            <span style={{ width: "32%" }} />
           </div>
           <span>Keep this window open and leave the PC connected to power.</span>
         </div>
       )}
-      {sha && <p className="mono">{sha}</p>}
       {windowsOnly && (
         <p className="banner">
           prepare_installer_partition, stage_bootloader, write_cidata, and set_boot_next
@@ -1829,27 +1999,36 @@ function MutateStep({
               </button>
             ) : (
               <>
-                <button type="button" className="btn primary" onClick={() => setTick((n) => n + 1)}>
-                  Retry
-                </button>
-                <button
-                  type="button"
-                  className="btn ghost"
-                  disabled={busyAction}
-                  onClick={() => {
-                    setBusyAction(true);
-                    void onUndo()
-                      .then(() => {
-                        setError(null);
-                        setReady(false);
-                        setPhase("stopped");
-                      })
-                      .catch((err: unknown) => setError(invokeError(err)))
-                      .finally(() => setBusyAction(false));
-                  }}
-                >
-                  Undo staging
-                </button>
+                {recovery?.disposition !== "manualReconciliationRequired" &&
+                  recovery?.disposition !== "rollbackRequired" && (
+                    <button type="button" className="btn primary" onClick={() => {
+                      setTick((n) => n + 1);
+                    }}>
+                      {recovery?.disposition === "safeToRetry" ? "Resume safely" : "Retry"}
+                    </button>
+                  )}
+                {recovery?.disposition !== "manualReconciliationRequired" && (
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busyAction}
+                    onClick={() => {
+                      setBusyAction(true);
+                      void onUndo()
+                        .then(() => {
+                          setError(null);
+                          setReady(false);
+                          setPhase("stopped");
+                        })
+                        .catch((err: unknown) => setError(invokeError(err)))
+                        .finally(() => setBusyAction(false));
+                    }}
+                  >
+                    {recovery?.disposition === "rollbackRequired"
+                      ? "Resume rollback"
+                      : "Undo staging"}
+                  </button>
+                )}
               </>
             )}
             <button

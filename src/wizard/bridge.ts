@@ -1,3 +1,5 @@
+import packageMetadata from "../../package.json";
+
 export type RuntimeMode = "tauri" | "browser" | "preview";
 
 type EventEnvelope<T> = { payload: T };
@@ -128,7 +130,7 @@ export async function getVersion(): Promise<string> {
     return api.getVersion();
   }
   if (runtimeMode() === "browser") return invoke<string>("_version");
-  return "0.4.17";
+  return packageMetadata.version;
 }
 
 export async function closeApp() {

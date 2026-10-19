@@ -1,13 +1,31 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Serializes operations that inspect or mutate installer-owned disk state.
 #[derive(Clone, Default)]
-pub struct OperationGate(Arc<Mutex<()>>);
+pub struct OperationGate {
+    mutex: Arc<Mutex<()>>,
+    cancellation_requested: Arc<AtomicBool>,
+}
 
 impl OperationGate {
     pub async fn lock(&self) -> OwnedMutexGuard<()> {
-        self.0.clone().lock_owned().await
+        self.mutex.clone().lock_owned().await
+    }
+
+    pub fn reset_cancellation(&self) {
+        self.cancellation_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn request_cancellation(&self) {
+        self.cancellation_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested.load(Ordering::SeqCst)
     }
 }
 
@@ -38,5 +56,15 @@ mod tests {
             task.await.unwrap();
             assert!(entered.load(Ordering::SeqCst));
         });
+    }
+
+    #[test]
+    fn cancellation_is_shared_and_resettable() {
+        let gate = OperationGate::default();
+        let observer = gate.clone();
+        gate.request_cancellation();
+        assert!(observer.cancellation_requested());
+        observer.reset_cancellation();
+        assert!(!gate.cancellation_requested());
     }
 }

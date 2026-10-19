@@ -121,6 +121,61 @@ export type PrepareResult = {
   partitionBytes: number;
 };
 
+export type InstallPlan = {
+  version: number;
+  targetDiskGuid: string;
+  targetDiskNumber: number;
+  targetDiskDeviceId: string;
+  windowsPartitionGuid: string;
+  windowsPartitionOffsetBytes: number;
+  oldCSizeBytes: number;
+  newCSizeBytes: number;
+  espPartitionGuid: string;
+  espVolumeGuid: string;
+  omarchyinstOffsetBytes: number;
+  omarchyinstSizeBytes: number;
+  cidataOffsetBytes: number;
+  cidataSizeBytes: number;
+  linuxDevice: string;
+  isoSha256: string;
+  isoSizeBytes: number;
+  bootContractVersion: number;
+  cidataContractVersion: number;
+  acknowledgementVersion: number;
+  destructiveEraseAcknowledged: boolean;
+  bitlockerRiskAcknowledged: boolean;
+};
+
+export type InstallPlanPreview = {
+  plan: InstallPlan;
+  digest: string;
+};
+
+export type InstallProgress = {
+  sequence: number;
+  phase: "prepare" | "stage" | "cidata" | "bootnext";
+  status: "started" | "completed" | "failed";
+  operationId: string | null;
+  planDigest: string | null;
+  detail: string | null;
+};
+
+export type RecoveryDisposition =
+  | "fresh"
+  | "safeToResume"
+  | "safeToRetry"
+  | "rollbackRequired"
+  | "manualReconciliationRequired"
+  | "completed";
+
+export type RecoveryAssessment = {
+  disposition: RecoveryDisposition;
+  reason: string;
+  operationId: string | null;
+  step: string | null;
+  pendingOperation: string | null;
+};
+
 export type StageResult = {
   espGuid: string;
   searchFilename: string;
@@ -152,8 +207,10 @@ export type StateJournal = {
   omarchyinstGuid: string | null;
   cidataGuid: string | null;
   linuxDevice: string | null;
+  isoSha256?: string | null;
   searchFilename: string | null;
   bootId: string | null;
+  planDigest?: string | null;
 };
 
 export const INSTALLER_HOLE_BYTES = 8 * 1024 ** 3 + 512 * 1024 ** 2;

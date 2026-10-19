@@ -1,3 +1,4 @@
+mod artifact;
 mod browser;
 mod cidata;
 mod commands;
@@ -5,50 +6,65 @@ mod diagnostics;
 mod download;
 mod error;
 mod grub;
+mod instance;
 mod iso;
 mod journal;
 mod operation;
 mod partition;
 mod paths;
+mod plan;
 mod platform;
 mod probe;
+mod recovery;
 mod winvol;
+mod workflow;
 
 /// Runs the private, bounded storage child-process protocol before Tauri starts.
 /// This is a no-op on non-Windows hosts and for normal application launches.
-pub fn run_storage_helper_if_requested() -> bool {
+pub fn run_private_helper_if_requested() -> bool {
     #[cfg(windows)]
     {
-        return platform::windows::run_storage_helper_if_requested();
+        return platform::windows::run_private_helper_if_requested();
     }
     #[cfg(not(windows))]
     false
 }
 
+/// Retained for callers built against the original storage-only helper API.
+pub fn run_storage_helper_if_requested() -> bool {
+    run_private_helper_if_requested()
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // Keep this first: the plugin must claim the process-wide instance
+        // before any other plugin performs startup work.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            instance::focus_existing(app);
+        }))
         .manage(operation::OperationGate::default())
         .plugin(tauri_plugin_opener::init())
         .plugin({
-            let mut log = tauri_plugin_log::Builder::new()
-                .level(if cfg!(debug_assertions) {
-                    log::LevelFilter::Debug
-                } else {
-                    log::LevelFilter::Info
-                })
-                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
-                .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Stdout,
-                ));
+            let mut targets = vec![tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::Stdout,
+            )];
             if let Ok(dir) = paths::install_logs_dir() {
-                log = log.target(tauri_plugin_log::Target::new(
+                targets.push(tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Folder {
                         path: dir,
                         file_name: Some("omarchy-install".into()),
                     },
                 ));
             }
-            log.build()
+            tauri_plugin_log::Builder::new()
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .targets(targets)
+                .build()
         })
         .invoke_handler(tauri::generate_handler![
             commands::exit_app,
@@ -57,14 +73,13 @@ pub fn run() {
             commands::relaunch_elevated,
             commands::reboot_to_firmware,
             commands::load_install_state,
+            commands::assess_install_recovery,
             commands::download_iso,
             commands::pick_local_iso,
             commands::prepare_local_iso,
             commands::verify_iso,
-            commands::prepare_installer_partition,
-            commands::stage_bootloader,
-            commands::write_cidata,
-            commands::set_boot_next,
+            commands::preview_install_plan,
+            commands::execute_install,
             commands::reboot_to_installer,
             commands::abort_and_rollback,
             commands::export_support_bundle,
@@ -98,6 +113,17 @@ pub fn run() {
             };
 
             if let Err(error) = window_result {
+                // Tauri exits when its last native window closes. Browser mode
+                // deliberately has no webview, so retain one invisible native
+                // window to keep the event loop and localhost server alive.
+                tauri::window::WindowBuilder::new(app, "browser-fallback-keeper")
+                    .visible(false)
+                    .build()
+                    .map_err(|keeper_error| {
+                        std::io::Error::other(format!(
+                            "could not create browser fallback keeper: {keeper_error}"
+                        ))
+                    })?;
                 if let Err(fallback_error) = browser::launch(app.handle(), &error) {
                     show_startup_error(&fallback_error);
                     return Err(std::io::Error::other(fallback_error).into());

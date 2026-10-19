@@ -171,6 +171,7 @@ pub fn empty_journal() -> StateJournal {
         linux_device: None,
         old_c_size_bytes: None,
         iso_sha256: None,
+        plan_digest: None,
         search_filename: None,
         boot_id: None,
         boot_description: None,

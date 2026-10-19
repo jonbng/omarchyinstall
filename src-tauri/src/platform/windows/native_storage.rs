@@ -43,6 +43,7 @@ const HELPER_ARG: &str = "--storage-helper";
 const SELF_TEST_ARG: &str = "--storage-self-test";
 const PROTOCOL_VERSION: u32 = 2;
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(10);
+const ESP_TYPE_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,14 +263,17 @@ fn inventory_in_process() -> Result<NativeStorageReport> {
         let matches: Vec<_> = disk
             .partitions
             .iter_mut()
-            .filter(|p| p.offset_bytes == extent.offset_bytes)
+            .filter(|p| {
+                p.offset_bytes == extent.offset_bytes && p.size_bytes == extent.length_bytes
+            })
             .collect();
         if matches.len() != 1 {
             warnings.push(format!(
-                "volume {} extent at disk {} offset {} matched {} partitions",
+                "volume {} extent at disk {} offset {} length {} matched {} partitions exactly",
                 volume.volume_guid,
                 extent.disk_number,
                 extent.offset_bytes,
+                extent.length_bytes,
                 matches.len()
             ));
             continue;
@@ -281,6 +285,16 @@ fn inventory_in_process() -> Result<NativeStorageReport> {
         partition.fs = volume.fs.clone();
     }
 
+    let target = disks
+        .iter()
+        .find(|disk| disk.number == boot_disk_number)
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "native inventory lost target PhysicalDrive{boot_disk_number}"
+            ))
+        })?;
+    validate_target_identity(target, &boot_volume_guid)?;
+
     Ok(NativeStorageReport {
         elapsed_ms: started.elapsed().as_millis(),
         boot_volume_guid,
@@ -291,6 +305,69 @@ fn inventory_in_process() -> Result<NativeStorageReport> {
         issues,
         timings,
     })
+}
+
+fn validate_target_identity(disk: &NativeDisk, boot_volume_guid: &str) -> Result<()> {
+    if disk.partition_style != "gpt" {
+        return Err(Error::Message(format!(
+            "target PhysicalDrive{} is not GPT",
+            disk.number
+        )));
+    }
+
+    let windows_partitions: Vec<_> = disk
+        .partitions
+        .iter()
+        .filter(|partition| {
+            partition
+                .volume_guid
+                .as_deref()
+                .is_some_and(|guid| guid.eq_ignore_ascii_case(boot_volume_guid))
+        })
+        .collect();
+    if windows_partitions.len() != 1 {
+        return Err(Error::Message(format!(
+            "Windows volume {boot_volume_guid} matched {} target partitions exactly; one is required",
+            windows_partitions.len()
+        )));
+    }
+    if windows_partitions[0]
+        .gpt_guid
+        .as_deref()
+        .map_or(true, is_zero_guid)
+    {
+        return Err(Error::Message(
+            "Windows system partition has no stable GPT identity".into(),
+        ));
+    }
+
+    let esps: Vec<_> = disk
+        .partitions
+        .iter()
+        .filter(|partition| {
+            partition
+                .type_guid
+                .as_deref()
+                .is_some_and(|guid| guid.eq_ignore_ascii_case(ESP_TYPE_GUID))
+        })
+        .collect();
+    if esps.len() != 1 {
+        return Err(Error::Message(format!(
+            "target PhysicalDrive{} has {} EFI system partitions; exactly one is required",
+            disk.number,
+            esps.len()
+        )));
+    }
+    if esps[0]
+        .volume_guid
+        .as_deref()
+        .map_or(true, |guid| guid.trim().is_empty())
+    {
+        return Err(Error::Message(
+            "target EFI system partition has no stable volume GUID association".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn collect_disks<F>(
@@ -360,7 +437,7 @@ fn read_disk(number: u32) -> Result<NativeDisk> {
     let layout_bytes = ioctl_growing(handle.0, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, None, 4096)?;
     let (style, disk_guid, partitions) = parse_layout(&layout_bytes)?;
     let descriptor = storage_descriptor(handle.0)?;
-    Ok(NativeDisk {
+    let disk = NativeDisk {
         number,
         device_id,
         size_bytes: nonnegative(length.Length, "disk length")?,
@@ -370,7 +447,90 @@ fn read_disk(number: u32) -> Result<NativeDisk> {
         model: descriptor.model,
         serial: descriptor.serial,
         partitions,
-    })
+    };
+    validate_disk_layout(&disk)?;
+    Ok(disk)
+}
+
+fn validate_disk_layout(disk: &NativeDisk) -> Result<()> {
+    if disk.size_bytes == 0 {
+        return Err(Error::Message(format!(
+            "PhysicalDrive{} reported zero length",
+            disk.number
+        )));
+    }
+    if disk.partition_style == "unknown" {
+        return Err(Error::Message(format!(
+            "PhysicalDrive{} reported an unknown partition style",
+            disk.number
+        )));
+    }
+    if disk.partition_style == "gpt" && disk.disk_guid.as_deref().map_or(true, is_zero_guid) {
+        return Err(Error::Message(format!(
+            "PhysicalDrive{} reported a missing or zero GPT disk GUID",
+            disk.number
+        )));
+    }
+
+    let mut numbers = std::collections::HashSet::new();
+    let mut guids = std::collections::HashSet::new();
+    let mut ranges = Vec::with_capacity(disk.partitions.len());
+    for partition in &disk.partitions {
+        if partition.number == 0 || !numbers.insert(partition.number) {
+            return Err(Error::Message(format!(
+                "PhysicalDrive{} has a zero or duplicate partition number {}",
+                disk.number, partition.number
+            )));
+        }
+        let end = partition
+            .offset_bytes
+            .checked_add(partition.size_bytes)
+            .ok_or_else(|| Error::Message("partition range overflow".into()))?;
+        if partition.size_bytes == 0 || end > disk.size_bytes {
+            return Err(Error::Message(format!(
+                "PhysicalDrive{} partition {} is outside the disk bounds",
+                disk.number, partition.number
+            )));
+        }
+        if disk.partition_style == "gpt" {
+            let Some(guid) = partition.gpt_guid.as_deref() else {
+                return Err(Error::Message(format!(
+                    "PhysicalDrive{} GPT partition {} has no partition GUID",
+                    disk.number, partition.number
+                )));
+            };
+            if is_zero_guid(guid) || !guids.insert(guid.to_ascii_lowercase()) {
+                return Err(Error::Message(format!(
+                    "PhysicalDrive{} GPT partition {} has a zero or duplicate GUID",
+                    disk.number, partition.number
+                )));
+            }
+            if partition.type_guid.as_deref().map_or(true, is_zero_guid) {
+                return Err(Error::Message(format!(
+                    "PhysicalDrive{} GPT partition {} has a missing or zero type GUID",
+                    disk.number, partition.number
+                )));
+            }
+        }
+        ranges.push((partition.offset_bytes, end, partition.number));
+    }
+    ranges.sort_unstable_by_key(|range| range.0);
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(Error::Message(format!(
+                "PhysicalDrive{} partitions {} and {} overlap",
+                disk.number, pair[0].2, pair[1].2
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_zero_guid(value: &str) -> bool {
+    value
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}')
+        .eq_ignore_ascii_case("00000000-0000-0000-0000-000000000000")
 }
 
 struct Descriptor {
@@ -555,6 +715,11 @@ fn parse_extents(bytes: &[u8]) -> Result<Vec<NativeExtent>> {
             bytes.len()
         )));
     }
+    if count == 0 {
+        return Err(Error::Message(
+            "volume reported zero physical disk extents".into(),
+        ));
+    }
     (0..count)
         .map(|index| {
             let e = read_struct::<windows::Win32::System::Ioctl::DISK_EXTENT>(
@@ -562,10 +727,16 @@ fn parse_extents(bytes: &[u8]) -> Result<Vec<NativeExtent>> {
                 first + index * entry_size,
                 "disk extent",
             )?;
+            let length_bytes = nonnegative(e.ExtentLength, "extent length")?;
+            if length_bytes == 0 {
+                return Err(Error::Message(
+                    "volume reported a zero-length extent".into(),
+                ));
+            }
             Ok(NativeExtent {
                 disk_number: e.DiskNumber,
                 offset_bytes: nonnegative(e.StartingOffset, "extent offset")?,
-                length_bytes: nonnegative(e.ExtentLength, "extent length")?,
+                length_bytes,
             })
         })
         .collect()
@@ -957,6 +1128,120 @@ mod tests {
             serial: Some("test".into()),
             partitions: Vec::new(),
         }
+    }
+
+    fn valid_gpt_disk() -> NativeDisk {
+        NativeDisk {
+            number: 0,
+            device_id: r"\\.\PHYSICALDRIVE0".into(),
+            size_bytes: 10_000,
+            partition_style: "gpt".into(),
+            disk_guid: Some("11111111-1111-1111-1111-111111111111".into()),
+            bus: "NVMe".into(),
+            model: Some("test".into()),
+            serial: Some("test".into()),
+            partitions: vec![
+                NativePartition {
+                    number: 1,
+                    offset_bytes: 1_000,
+                    size_bytes: 2_000,
+                    gpt_guid: Some("22222222-2222-2222-2222-222222222222".into()),
+                    type_guid: Some("33333333-3333-3333-3333-333333333333".into()),
+                    volume_guid: None,
+                    mount_paths: vec![],
+                    label: None,
+                    fs: None,
+                },
+                NativePartition {
+                    number: 2,
+                    offset_bytes: 4_000,
+                    size_bytes: 2_000,
+                    gpt_guid: Some("44444444-4444-4444-4444-444444444444".into()),
+                    type_guid: Some("55555555-5555-5555-5555-555555555555".into()),
+                    volume_guid: None,
+                    mount_paths: vec![],
+                    label: None,
+                    fs: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn accepts_well_formed_gpt_layout() {
+        validate_disk_layout(&valid_gpt_disk()).unwrap();
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_and_overlapping_partitions() {
+        let mut disk = valid_gpt_disk();
+        disk.partitions[1].offset_bytes = 2_000;
+        assert!(validate_disk_layout(&disk)
+            .unwrap_err()
+            .to_string()
+            .contains("overlap"));
+
+        let mut disk = valid_gpt_disk();
+        disk.partitions[1].size_bytes = 7_000;
+        assert!(validate_disk_layout(&disk)
+            .unwrap_err()
+            .to_string()
+            .contains("outside"));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_zero_gpt_identities() {
+        let mut disk = valid_gpt_disk();
+        disk.partitions[1].gpt_guid = disk.partitions[0].gpt_guid.clone();
+        assert!(validate_disk_layout(&disk)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate GUID"));
+
+        let mut disk = valid_gpt_disk();
+        disk.disk_guid = Some("00000000-0000-0000-0000-000000000000".into());
+        assert!(validate_disk_layout(&disk)
+            .unwrap_err()
+            .to_string()
+            .contains("zero GPT disk GUID"));
+    }
+
+    #[test]
+    fn target_identity_requires_exact_windows_and_esp_associations() {
+        let mut disk = valid_gpt_disk();
+        let boot_volume = r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\";
+        disk.partitions[0].type_guid = Some(ESP_TYPE_GUID.into());
+        disk.partitions[0].volume_guid =
+            Some(r"\\?\Volume{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}\".into());
+        disk.partitions[1].volume_guid = Some(boot_volume.to_ascii_uppercase());
+        validate_target_identity(&disk, boot_volume).unwrap();
+
+        disk.partitions[1].volume_guid = None;
+        assert!(validate_target_identity(&disk, boot_volume)
+            .unwrap_err()
+            .to_string()
+            .contains("matched 0 target partitions"));
+    }
+
+    #[test]
+    fn target_identity_rejects_ambiguous_esps() {
+        let mut disk = valid_gpt_disk();
+        let boot_volume = r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\";
+        for partition in &mut disk.partitions {
+            partition.type_guid = Some(ESP_TYPE_GUID.into());
+            partition.volume_guid = Some(boot_volume.into());
+        }
+        assert!(validate_target_identity(&disk, boot_volume)
+            .unwrap_err()
+            .to_string()
+            .contains("matched 2 target partitions"));
+
+        disk.partitions[1].volume_guid =
+            Some(r"\\?\Volume{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}\".into());
+        assert!(validate_target_identity(&disk, boot_volume)
+            .unwrap_err()
+            .to_string()
+            .contains("2 EFI system partitions"));
     }
 
     #[test]

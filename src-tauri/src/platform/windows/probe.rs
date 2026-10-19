@@ -11,7 +11,10 @@ use crate::platform::{
 };
 use crate::probe::{self, volume_is_fve};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 use windows::{
     core::{w, PCWSTR},
     Win32::{
@@ -38,10 +41,19 @@ use windows::{
 };
 
 const OMARCHY_VENDOR: PCWSTR = w!("{FDCA2A4E-3D8D-4EB7-AE97-80598A4D5DB4}");
-const OMARCHY_WRITE_PROBE: PCWSTR = w!("OmarchyInstallWriteProbe");
 const EFI_VARIABLE_ATTRIBUTES: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 const LDM_META: &str = "5808c8aa-7e8f-42e0-85d2-e1e90434cfb3";
 const LDM_DATA: &str = "af9b60a0-1431-4f62-bc68-3311714a69ad";
+const PRECHECK_SELF_TEST_ARG: &str = "--precheck-self-test";
+const PRECHECK_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProbeStageTiming {
+    pub stage: String,
+    pub elapsed_ms: u128,
+    pub succeeded: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +70,46 @@ pub(crate) struct NativeProbeDiagnostics {
     pub shrink_error: Option<String>,
     pub shrink_status: String,
     pub bitlocker: BitlockerDiagnostics,
+    pub timings: Vec<ProbeStageTiming>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrecheckSelfTestEnvelope {
+    protocol_version: u32,
+    elapsed_ms: u128,
+    probe: Option<MachineProbe>,
+    diagnostics: Option<NativeProbeDiagnostics>,
+    error: Option<String>,
+}
+
+pub(super) fn run_self_test_if_requested() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() != 1 || args[0] != PRECHECK_SELF_TEST_ARG {
+        return false;
+    }
+    let started = Instant::now();
+    let envelope = match probe_machine_detailed() {
+        Ok((probe, diagnostics)) => PrecheckSelfTestEnvelope {
+            protocol_version: PRECHECK_PROTOCOL_VERSION,
+            elapsed_ms: started.elapsed().as_millis(),
+            probe: Some(probe),
+            diagnostics: Some(diagnostics),
+            error: None,
+        },
+        Err(error) => PrecheckSelfTestEnvelope {
+            protocol_version: PRECHECK_PROTOCOL_VERSION,
+            elapsed_ms: started.elapsed().as_millis(),
+            probe: None,
+            diagnostics: None,
+            error: Some(error.to_string()),
+        },
+    };
+    let output = serde_json::to_vec(&envelope).unwrap_or_else(|_| {
+        br#"{"protocolVersion":1,"elapsedMs":0,"probe":null,"diagnostics":null,"error":"serialization failed"}"#.to_vec()
+    });
+    let _ = std::io::stdout().write_all(&output);
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,10 +126,18 @@ pub fn probe_machine() -> Result<MachineProbe> {
 
 pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagnostics)> {
     let probe_started = Instant::now();
+    let mut timings = Vec::new();
+    let stage = Instant::now();
     let host = super::host_info()?;
+    timings.push(ProbeStageTiming {
+        stage: "host".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: true,
+    });
     // WMI is independent and occasionally slow. Let it overlap native storage
     // inventory so the two read-only checks do not serialize the precheck.
     let bitlocker_thread = std::thread::spawn(query_bitlocker);
+    let stage = Instant::now();
     let uefi = is_uefi();
     let secure_boot = secure_boot_enabled();
     let efi_vars_writable = if uefi {
@@ -85,7 +145,19 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     } else {
         false
     };
+    timings.push(ProbeStageTiming {
+        stage: "firmware-security".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: true,
+    });
+    let stage = Instant::now();
     let (ram_installed_bytes, ram_total_phys_bytes, ram_avail_bytes) = ram_bytes();
+    timings.push(ProbeStageTiming {
+        stage: "memory".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: true,
+    });
+    let stage = Instant::now();
     let (inventory_envelope, inventory, inventory_failure) =
         match native_storage::inventory_report() {
             Ok(envelope) => {
@@ -104,8 +176,20 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
                 (None, None, Some(error.to_string()))
             }
         };
+    timings.push(ProbeStageTiming {
+        stage: "storage".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: inventory_failure.is_none(),
+    });
+    let stage = Instant::now();
     let tpm_present = tpm_present_tbs();
+    timings.push(ProbeStageTiming {
+        stage: "tpm".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: true,
+    });
 
+    let stage = Instant::now();
     let bitlocker_diagnostics = bitlocker_thread
         .join()
         .unwrap_or_else(|_| BitlockerDiagnostics {
@@ -113,6 +197,12 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
             volumes: Vec::new(),
             error: Some("BitLocker WMI worker panicked".into()),
         });
+    timings.push(ProbeStageTiming {
+        stage: "bitlocker-wait".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: bitlocker_diagnostics.error.is_none(),
+    });
+    let stage = Instant::now();
     let bitlocker_inventory = bitlocker_diagnostics.volumes.clone();
     let bitlocker_error = bitlocker_diagnostics.error.clone();
     let disks = inventory
@@ -230,7 +320,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         disks,
         blocking_reasons: inventory_reasons,
     };
-    let diagnostics = NativeProbeDiagnostics {
+    let mut diagnostics = NativeProbeDiagnostics {
         protocol_version: 2,
         elapsed_ms: probe_started.elapsed().as_millis(),
         inventory_envelope,
@@ -240,8 +330,15 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         shrink_error: None,
         shrink_status: "deferred-to-resize".into(),
         bitlocker: bitlocker_diagnostics,
+        timings,
     };
-    Ok((probe::attach_reasons(probe, true), diagnostics))
+    let probe = probe::attach_reasons(probe, true);
+    diagnostics.timings.push(ProbeStageTiming {
+        stage: "association-policy".into(),
+        elapsed_ms: stage.elapsed().as_millis(),
+        succeeded: true,
+    });
+    Ok((probe, diagnostics))
 }
 
 fn is_uefi() -> bool {
@@ -268,10 +365,19 @@ fn efi_variables_writable() -> bool {
     if enable_system_environment_privilege().is_err() {
         return false;
     }
+    // Separate app processes can probe concurrently (support tools and test
+    // harnesses do this even though the GUI is single-instance). A shared
+    // variable name lets one process read or delete another process's nonce,
+    // producing a false EfiVarsLocked blocker.
+    let variable_name: Vec<u16> = format!("OmarchyInstallWriteProbe-{}", std::process::id())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let variable_name = PCWSTR(variable_name.as_ptr());
     let nonce = std::process::id().to_le_bytes();
     let write = unsafe {
         SetFirmwareEnvironmentVariableExW(
-            OMARCHY_WRITE_PROBE,
+            variable_name,
             OMARCHY_VENDOR,
             Some(nonce.as_ptr().cast()),
             nonce.len() as u32,
@@ -285,7 +391,7 @@ fn efi_variables_writable() -> bool {
     let mut readback = [0u8; 4];
     let read = unsafe {
         GetFirmwareEnvironmentVariableW(
-            OMARCHY_WRITE_PROBE,
+            variable_name,
             OMARCHY_VENDOR,
             Some(readback.as_mut_ptr().cast()),
             readback.len() as u32,
@@ -293,7 +399,7 @@ fn efi_variables_writable() -> bool {
     };
     let deleted = unsafe {
         SetFirmwareEnvironmentVariableExW(
-            OMARCHY_WRITE_PROBE,
+            variable_name,
             OMARCHY_VENDOR,
             None,
             0,

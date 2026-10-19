@@ -10,8 +10,8 @@ mod process;
 mod registry;
 
 use super::{
-    BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
-    StageResult, StateJournal,
+    BootNextResult, CidataResult, HostInfo, InstallPlanPreview, MachineProbe, PrepareResult,
+    RollbackResult, StageResult, StateJournal,
 };
 
 use crate::cidata::CidataIdentity;
@@ -38,8 +38,8 @@ pub fn probe_machine() -> Result<MachineProbe> {
     probe::probe_machine()
 }
 
-pub(crate) fn run_storage_helper_if_requested() -> bool {
-    native_storage::run_helper_if_requested()
+pub(crate) fn run_private_helper_if_requested() -> bool {
+    native_storage::run_helper_if_requested() || probe::run_self_test_if_requested()
 }
 
 pub fn relaunch_elevated() -> Result<()> {
@@ -76,8 +76,26 @@ pub fn pick_local_iso(owner: Option<isize>) -> Result<Option<std::path::PathBuf>
     dialog::pick_local_iso(owner)
 }
 
-pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
-    mutate::prepare_installer_partition(allow_bitlocker)
+pub fn preview_install_plan(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    iso_size_bytes: u64,
+) -> Result<InstallPlanPreview> {
+    let probe = probe::probe_machine()?;
+    let linux_device = probe
+        .linux_by_id
+        .as_deref()
+        .ok_or_else(|| Error::Message("linux /dev/disk/by-id path missing".into()))?;
+    crate::cidata::windows_vm_archinstall_device(linux_device)?;
+    crate::plan::build(&probe, &iso_sha256, iso_size_bytes, allow_bitlocker)
+}
+
+pub fn prepare_installer_partition(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    approved_plan_digest: String,
+) -> Result<PrepareResult> {
+    mutate::prepare_installer_partition(allow_bitlocker, iso_sha256, approved_plan_digest)
 }
 
 pub fn stage_bootloader() -> Result<StageResult> {

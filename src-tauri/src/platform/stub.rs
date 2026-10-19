@@ -5,11 +5,12 @@
 //! Never shrinks disks, never writes EFI, never reboots.
 
 use super::{
-    BitlockerVolume, BootNextResult, CidataResult, DiskMap, HostInfo, JournalStep, MachineProbe,
-    PartitionMap, PrepareResult, RollbackResult, StageResult, StateJournal, TargetEsp,
+    BitlockerVolume, BootNextResult, CidataResult, DiskMap, HostInfo, InstallPlanPreview,
+    JournalStep, MachineProbe, PartitionMap, PrepareResult, RollbackResult, StageResult,
+    StateJournal, TargetEsp,
 };
 use crate::cidata::CidataIdentity;
-use crate::download::{self, STUB_ISO_BYTES};
+use crate::download::STUB_ISO_BYTES;
 use crate::error::{Error, Result};
 use crate::grub::emit_grub_cfg;
 use crate::journal::{empty_journal, parse_journal, serialize_journal};
@@ -94,9 +95,53 @@ pub fn load_install_state() -> Result<Option<StateJournal>> {
     load_journal()
 }
 
-pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
+pub fn preview_install_plan(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    iso_size_bytes: u64,
+) -> Result<InstallPlanPreview> {
+    let probe = probe_machine()?;
+    crate::plan::build(&probe, &iso_sha256, iso_size_bytes, allow_bitlocker)
+}
+
+pub fn prepare_installer_partition(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    approved_plan_digest: String,
+) -> Result<PrepareResult> {
     dry_run_pause();
-    if let Some(journal) = load_journal()? {
+    let iso_sha256 = crate::artifact::normalize_sha256(&iso_sha256)?;
+    crate::plan::require_digest(&approved_plan_digest)?;
+    let approved_plan_digest = approved_plan_digest.to_ascii_lowercase();
+    if let Some(mut journal) = load_journal()? {
+        if journal
+            .iso_sha256
+            .as_deref()
+            .is_some_and(|saved| saved != iso_sha256)
+        {
+            return Err(Error::Message(
+                "verified installation media changed after staging began; undo staging before using another ISO"
+                    .into(),
+            ));
+        }
+        if journal.iso_sha256.is_none() {
+            journal.iso_sha256 = Some(iso_sha256.clone());
+            save_journal(&journal)?;
+        }
+        match journal.plan_digest.as_deref() {
+            Some(saved) if saved != approved_plan_digest => {
+                return Err(Error::Message(
+                    "approved install plan does not match the plan already being executed".into(),
+                ));
+            }
+            None if !matches!(journal.step, JournalStep::Planned) => {
+                return Err(Error::Message(
+                    "this legacy operation has already started and cannot be rebound to a new plan; resume it from its recorded step"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
         if let (Some(om), Some(partuuid), Some(ci), Some(old_c)) = (
             journal.omarchyinst_guid.clone(),
             journal.omarchyinst_partuuid.clone(),
@@ -133,6 +178,13 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     let partition_bytes = partition::omarchyinst_bytes(STUB_ISO_BYTES);
     let hole = partition::installer_hole_bytes(STUB_ISO_BYTES);
     partition::iso_fits_omarchyinst(STUB_ISO_BYTES, partition_bytes)?;
+    let preview = crate::plan::build(&probe, &iso_sha256, STUB_ISO_BYTES, allow_bitlocker)?;
+    if preview.digest != approved_plan_digest {
+        return Err(Error::Message(
+            "the approved install plan no longer matches the disk, ESP, ISO, or safety acknowledgements; review the updated plan"
+                .into(),
+        ));
+    }
     let old_c = probe
         .disks
         .iter()
@@ -164,7 +216,8 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     journal.esp_volume_guid = Some(esp.volume_guid.clone());
     journal.old_c_size_bytes = Some(old_c);
     journal.linux_device = probe.linux_by_id.clone();
-    journal.iso_sha256 = Some(download::stub_iso_sha256());
+    journal.iso_sha256 = Some(iso_sha256);
+    journal.plan_digest = Some(approved_plan_digest);
     journal.step = JournalStep::CidataPartitionCreated;
     save_journal(&journal)?;
     log::info!("dry-run: prepare_installer_partition (no disk writes)");
@@ -181,6 +234,8 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
 pub fn stage_bootloader() -> Result<StageResult> {
     dry_run_pause();
     let mut journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
+    journal.pending_operation = Some(super::PendingOperation::StageEsp);
+    save_journal(&journal)?;
     let cfg = emit_grub_cfg(STUB_OMARCHYINST_PARTUUID, STUB_ISO_BYTES);
     let mut hasher = Sha256::new();
     hasher.update(cfg.as_bytes());
@@ -189,6 +244,7 @@ pub fn stage_bootloader() -> Result<StageResult> {
     fs::create_dir_all(&grub_path)?;
     fs::write(grub_path.join("grub.cfg"), cfg.as_bytes())?;
     journal.search_filename = Some(STUB_SEARCH.into());
+    journal.pending_operation = None;
     journal.step = JournalStep::Staged;
     save_journal(&journal)?;
     log::info!("dry-run: stage_bootloader (wrote stub grub.cfg only)");
@@ -201,7 +257,7 @@ pub fn stage_bootloader() -> Result<StageResult> {
 
 pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
     dry_run_pause();
-    let journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
+    let mut journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
     let guid = journal
         .cidata_guid
         .clone()
@@ -221,6 +277,8 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
     let encrypt = identity.encrypt;
     let files = crate::cidata::build_cidata_files(&identity, &linux, disk_bytes)?;
     identity.password.clear();
+    journal.pending_operation = Some(super::PendingOperation::WriteCidata);
+    save_journal(&journal)?;
     let dir = stub_dir()?.join("cidata");
     fs::create_dir_all(&dir)?;
     fs::write(
@@ -245,6 +303,9 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
     crate::journal::refuse_password_field(
         &serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
     )?;
+    journal.pending_operation = None;
+    journal.step = JournalStep::CidataWritten;
+    save_journal(&journal)?;
     log::info!("dry-run: write_cidata (app data only)");
     Ok(CidataResult {
         cidata_guid: guid,
@@ -266,8 +327,16 @@ pub fn set_boot_next() -> Result<BootNextResult> {
             appended_boot_order: false,
         });
     }
-    journal.boot_id = Some(STUB_BOOT_ID.into());
     journal.boot_description = Some(format!("Omarchy Install {}", journal.operation_id));
+    journal.pending_operation = Some(super::PendingOperation::CreateBootEntry);
+    save_journal(&journal)?;
+    journal.boot_id = Some(STUB_BOOT_ID.into());
+    journal.pending_operation = None;
+    journal.step = JournalStep::BootEntryCreated;
+    save_journal(&journal)?;
+    journal.pending_operation = Some(super::PendingOperation::SetBootNext);
+    save_journal(&journal)?;
+    journal.pending_operation = None;
     journal.step = JournalStep::BootNextSet;
     save_journal(&journal)?;
     log::info!("dry-run: set_boot_next (NVRAM not written)");
@@ -544,7 +613,23 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("XDG_DATA_HOME", &home);
 
-        let prepared = prepare_installer_partition(false).expect("prepare");
+        let iso_sha256 = crate::download::stub_iso_sha256();
+        let plan = preview_install_plan(false, iso_sha256.clone(), STUB_ISO_BYTES).expect("plan");
+        let mut stale_digest = plan.digest.clone();
+        stale_digest.replace_range(
+            ..1,
+            if stale_digest.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        let stale = prepare_installer_partition(false, iso_sha256.clone(), stale_digest)
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("approved install plan no longer matches"));
+        let prepared = prepare_installer_partition(false, iso_sha256.clone(), plan.digest.clone())
+            .expect("prepare");
         assert_eq!(prepared.omarchyinst_partuuid, STUB_OMARCHYINST_PARTUUID);
         assert!(prepared.partition_bytes >= 8 * GIB);
 
@@ -591,12 +676,14 @@ mod tests {
 
         let state = load_install_state().unwrap().expect("journal");
         assert!(matches!(state.step, JournalStep::BootNextSet));
+        assert_eq!(state.plan_digest.as_deref(), Some(plan.digest.as_str()));
         assert!(!serialize_journal(&state).unwrap().contains("password"));
 
         let bundle = export_support_bundle().expect("bundle");
         assert!(bundle.exists());
 
-        let prepared_again = prepare_installer_partition(false).expect("prepare idempotent");
+        let prepared_again = prepare_installer_partition(false, iso_sha256, plan.digest)
+            .expect("prepare idempotent");
         assert_eq!(prepared_again.omarchyinst_guid, prepared.omarchyinst_guid);
         let boot_again = set_boot_next().expect("bootnext idempotent");
         assert_eq!(boot_again.boot_id, STUB_BOOT_ID);
@@ -606,6 +693,38 @@ mod tests {
         assert!(!rb.extended_ntfs);
         assert!(load_install_state().unwrap().is_none());
         assert!(!home.join("OmarchyInstall").join("stub").exists());
+
+        let plan = preview_install_plan(false, crate::download::stub_iso_sha256(), STUB_ISO_BYTES)
+            .expect("workflow plan");
+        let mut progress = Vec::new();
+        let completed = crate::workflow::execute(
+            crate::workflow::InstallRequest {
+                identity: CidataIdentity {
+                    username: "workflow".into(),
+                    password: "vector-pass".into(),
+                    hostname: "box".into(),
+                    timezone: "UTC".into(),
+                    keyboard: "us".into(),
+                    encrypt: true,
+                    full_name: Some("Workflow Test".into()),
+                    email: None,
+                },
+                allow_bitlocker: false,
+                iso_sha256: plan.plan.iso_sha256,
+                approved_plan_digest: plan.digest,
+            },
+            |event| progress.push(event),
+            || false,
+        )
+        .expect("authoritative workflow");
+        assert!(matches!(completed.step, JournalStep::BootNextSet));
+        assert_eq!(progress.len(), 8);
+        assert!(progress
+            .windows(2)
+            .all(|events| events[0].sequence < events[1].sequence));
+        assert_eq!(progress.first().unwrap().phase, "prepare");
+        assert_eq!(progress.last().unwrap().phase, "bootnext");
+        abort_and_rollback().expect("workflow rollback");
 
         match prev_data {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),

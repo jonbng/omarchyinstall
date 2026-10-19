@@ -6,6 +6,7 @@ use super::{
     process::{output_with_timeout, run_storage_powershell, system_command, SystemTool},
     registry::{get_hklm_dword, set_hklm_dword},
 };
+use crate::artifact;
 use crate::cidata::{self, CidataIdentity};
 use crate::download;
 use crate::error::{Error, Result};
@@ -24,7 +25,6 @@ use crate::platform::{
 };
 use crate::probe;
 use crate::winvol::{gpt_partuuid, windows_volume_path};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -94,13 +94,40 @@ fn reuse_prepared(journal: &crate::platform::StateJournal, iso_size: u64) -> Opt
     })
 }
 
-pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResult> {
-    let (probe, _) = super::probe::probe_machine_detailed()?;
-    probe::require_complete(&probe)?;
+pub fn prepare_installer_partition(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    approved_plan_digest: String,
+) -> Result<PrepareResult> {
+    let iso_sha256 = artifact::normalize_sha256(&iso_sha256)?;
+    crate::plan::require_digest(&approved_plan_digest)?;
+    let approved_plan_digest = approved_plan_digest.to_ascii_lowercase();
     let existing = load_journal()?;
+    if existing
+        .as_ref()
+        .and_then(|journal| journal.iso_sha256.as_deref())
+        .is_some_and(|saved| saved != iso_sha256)
+    {
+        return Err(Error::Message(
+            "verified installation media changed after staging began; undo staging before using another ISO"
+                .into(),
+        ));
+    }
     let has_started = existing
         .as_ref()
         .is_some_and(|j| !matches!(j.step, JournalStep::Planned) || j.pending_operation.is_some());
+    let iso = download::iso_paths()?;
+    let (actual_iso_sha256, iso_size) = artifact::sha256_file(&iso.iso)?;
+    if actual_iso_sha256 != iso_sha256 {
+        return Err(Error::Message(format!(
+            "installation media changed after verification: expected {iso_sha256}, got {actual_iso_sha256}"
+        )));
+    }
+
+    // Hashing a multi-gigabyte ISO can take time. Probe only afterwards so the
+    // approved layout is recomputed as close as possible to the first mutation.
+    let (probe, _) = super::probe::probe_machine_detailed()?;
+    probe::require_complete(&probe)?;
     if probe.blocking_reasons.iter().any(|reason| {
         !has_started
             || !matches!(
@@ -125,12 +152,6 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
                 .into(),
         ));
     }
-    let iso = download::iso_paths()?;
-    let iso_size = if iso.iso.exists() {
-        fs::metadata(&iso.iso)?.len()
-    } else {
-        6 * probe::GIB
-    };
     require_omarchyinst_fs("ntfs")?;
     require_cidata_fs("fat32")?;
     let partition_bytes = partition::omarchyinst_bytes(iso_size);
@@ -138,6 +159,45 @@ pub fn prepare_installer_partition(allow_bitlocker: bool) -> Result<PrepareResul
     partition::iso_fits_omarchyinst(iso_size, partition_bytes)?;
 
     let mut journal = existing.unwrap_or_else(empty_journal);
+    if has_started {
+        match journal.plan_digest.as_deref() {
+            Some(saved) if saved == approved_plan_digest => {}
+            Some(_) => {
+                return Err(Error::Message(
+                    "approved install plan does not match the plan already being executed".into(),
+                ))
+            }
+            None => {
+                return Err(Error::Message(
+                    "this legacy operation has already started and cannot be rebound to a new plan; resume it from its recorded step"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        let preview = crate::plan::build(&probe, &iso_sha256, iso_size, allow_bitlocker)?;
+        if preview.digest != approved_plan_digest {
+            return Err(Error::Message(
+                "the approved install plan no longer matches the disk, ESP, ISO, or safety acknowledgements; review the updated plan"
+                    .into(),
+            ));
+        }
+        if journal
+            .plan_digest
+            .as_deref()
+            .is_some_and(|saved| saved != approved_plan_digest)
+        {
+            return Err(Error::Message(
+                "install plan changed after it was recorded; undo staging and review again".into(),
+            ));
+        }
+        journal.plan_digest = Some(approved_plan_digest.clone());
+    }
+    if journal.iso_sha256.is_none() {
+        journal.iso_sha256 = Some(iso_sha256);
+    }
+    // Persist the approved binding before recording any pending mutation.
+    save_journal(&journal)?;
     if let Some(existing) = reuse_prepared(&journal, iso_size) {
         log::info!("prepare: OMARCHYINST and cidata already exist; skip shrink");
         return Ok(existing);
@@ -308,11 +368,14 @@ $d=Get-Disk -Number {disk_number}
 if (([string]$d.Guid).Trim('{{}}') -ne '{disk_guid}') {{ throw 'target disk GUID changed' }}
 $matches=@(Get-Partition -DiskNumber {disk_number} | Where-Object {{ [uint64]$_.Offset -eq [uint64]{offset} }})
 if ($matches.Count -gt 1) {{ throw 'ambiguous partition at planned offset' }}
-if ($matches.Count -eq 0) {{ $p=New-Partition -DiskNumber {disk_number} -Offset ([uint64]{offset}) -Size ([uint64]{size}) -GptType '{{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}}' }} else {{ $p=$matches[0] }}
+$created=$false
+if ($matches.Count -eq 0) {{ $p=New-Partition -DiskNumber {disk_number} -Offset ([uint64]{offset}) -Size ([uint64]{size}) -GptType '{{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}}'; $created=$true }} else {{ $p=$matches[0] }}
 if ([uint64]$p.Size -ne [uint64]{size}) {{ throw 'partition at planned offset has wrong size' }}
+if (([string]$p.GptType).Trim('{{}}') -ne 'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7') {{ throw 'partition at planned offset has wrong GPT type' }}
 $v=$null
 try {{ $v=Get-Volume -Partition $p -ErrorAction Stop }} catch {{}}
-if (-not $v -or [string]$v.FileSystemType -ne '{filesystem}' -or [string]$v.FileSystemLabel -ne '{label}') {{ Format-Volume -Partition $p -FileSystem {filesystem} -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null; $v=Get-Volume -Partition $p }}
+if ($created) {{ Format-Volume -Partition $p -FileSystem {filesystem} -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null; $v=Get-Volume -Partition $p }}
+elseif (-not $v -or [string]$v.FileSystemType -ne '{filesystem}' -or [string]$v.FileSystemLabel -ne '{label}') {{ throw 'existing partition at planned offset is not an installer-owned volume' }}
 Set-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -NoDefaultDriveLetter $true -IsHidden {hidden}
 $p=Get-Partition -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber
 if ($p.DriveLetter) {{ Remove-PartitionAccessPath -DiskNumber {disk_number} -PartitionNumber $p.PartitionNumber -AccessPath ($p.DriveLetter + ':\') }}
@@ -330,6 +393,13 @@ if ({hidden} -and -not $p.IsHidden) {{ throw 'cidata hidden attribute was not se
 
 pub fn stage_bootloader() -> Result<StageResult> {
     let mut journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
+    // Journals produced before verified-media binding existed have no digest.
+    // Re-establish trust from the pinned signature before resuming them.
+    if journal.iso_sha256.is_none() {
+        let verified = download::verify_iso_files(|_| {})?;
+        journal.iso_sha256 = Some(verified.sha256);
+        save_journal(&journal)?;
+    }
     journal.pending_operation = Some(PendingOperation::StageEsp);
     save_journal(&journal)?;
     let omarchy = journal
@@ -349,9 +419,8 @@ pub fn stage_bootloader() -> Result<StageResult> {
         return Err(Error::Message("verified ISO is not in the cache".into()));
     }
     let dest_iso = PathBuf::from(format!("{}omarchy.iso", volume_root(&omarchy)?));
-    if !dest_iso.exists() {
-        fs::copy(&iso_src, &dest_iso)?;
-    }
+    let expected_iso_sha256 = required(&journal.iso_sha256, "verified ISO SHA-256")?;
+    artifact::verified_copy(&iso_src, &dest_iso, expected_iso_sha256)?;
     let iso_size = fs::metadata(&dest_iso)?.len();
     partition::iso_fits_omarchyinst(iso_size, partition::omarchyinst_bytes(iso_size))?;
     let stable_device = required(&journal.linux_device, "Linux stable disk identity")?;
@@ -363,7 +432,9 @@ pub fn stage_bootloader() -> Result<StageResult> {
         ));
     }
 
-    let mounted_iso = MountedIso::attach(&iso_src)?;
+    // Inspect and extract from the published copy, not the cache source. This
+    // proves the exact bytes firmware will boot remain readable after staging.
+    let mounted_iso = MountedIso::attach(&dest_iso)?;
     let iso_paths = collect_relative_files(mounted_iso.root())?;
     let search = grub::discover_search_filename(iso_paths.iter().map(String::as_str))?;
     for dest in grub::esp_stage_destinations(&search)? {
@@ -405,8 +476,11 @@ pub fn stage_bootloader() -> Result<StageResult> {
             "discovered ISO search bait is missing".into(),
         ));
     }
-    fs::copy(efi_src, &efi_dest)?;
-    fs::copy(bait_src, PathBuf::from(format!("{esp_root}{bait_windows}")))?;
+    copy_verified_artifact(&efi_src, &efi_dest)?;
+    copy_verified_artifact(
+        &bait_src,
+        &PathBuf::from(format!("{esp_root}{bait_windows}")),
+    )?;
 
     let cidata_guid = required(&journal.cidata_guid, "cidata volume GUID")?;
     validate_staging_volume(
@@ -447,10 +521,7 @@ pub fn stage_bootloader() -> Result<StageResult> {
     if let Some(parent) = cfg_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&cfg_path, cfg.as_bytes())?;
-    let mut hasher = Sha256::new();
-    hasher.update(cfg.as_bytes());
-    let grub_cfg_sha256 = format!("{:x}", hasher.finalize());
+    let (_, grub_cfg_sha256) = artifact::verified_write(&cfg_path, cfg.as_bytes())?;
     journal.pending_operation = None;
     journal.step = crate::platform::JournalStep::Staged;
     save_journal(&journal)?;
@@ -477,12 +548,12 @@ fn copy_vm_boot_file(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(&source, &destination)?;
-    if fs::metadata(&source)?.len() != fs::metadata(&destination)?.len() {
-        return Err(Error::Message(format!(
-            "VM boot file copy was truncated: {fat_relative}"
-        )));
-    }
+    copy_verified_artifact(&source, &destination)
+}
+
+fn copy_verified_artifact(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    let expected_sha256 = artifact::sha256_file(source)?.0;
+    artifact::verified_copy(source, destination, &expected_sha256)?;
     Ok(())
 }
 
@@ -548,7 +619,7 @@ fn validate_staging_volume(
 }
 
 pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
-    let journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
+    let mut journal = load_journal()?.ok_or_else(|| Error::Message("no state.json".into()))?;
     let guid = journal
         .cidata_guid
         .clone()
@@ -585,34 +656,92 @@ pub fn write_cidata(mut identity: CidataIdentity) -> Result<CidataResult> {
     let encrypt = identity.encrypt;
     let files = cidata::build_cidata_files(&identity, install_device, disk_bytes)?;
     identity.password.clear();
+    journal.pending_operation = Some(PendingOperation::WriteCidata);
+    save_journal(&journal)?;
     let root = volume_root(&guid)?;
-    fs::write(
-        format!("{root}user_configuration.json"),
-        files.user_configuration.as_bytes(),
-    )?;
-    fs::write(
-        format!("{root}user_credentials.json"),
-        files.user_credentials.as_bytes(),
-    )?;
-    fs::write(
-        format!("{root}user_encrypt_installation.txt"),
-        files.user_encrypt_installation.as_bytes(),
-    )?;
-    if let Some(name) = files.user_full_name {
-        fs::write(format!("{root}user_full_name.txt"), name.as_bytes())?;
-    }
-    if let Some(email) = files.user_email {
-        fs::write(format!("{root}user_email_address.txt"), email.as_bytes())?;
-    }
+    write_and_verify_cidata(&root, &files)?;
     let body = fs::read_to_string(journal_path()?)?;
     journal::refuse_password_field(
         &serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
     )?;
+    journal.pending_operation = None;
+    journal.step = JournalStep::CidataWritten;
+    save_journal(&journal)?;
     Ok(CidataResult {
         cidata_guid: guid,
         linux_device: install_device.into(),
         encrypt,
     })
+}
+
+fn write_and_verify_cidata(root: &str, files: &cidata::CidataFiles) -> Result<()> {
+    let root = PathBuf::from(root);
+    verified_json_write(
+        &root.join("user_configuration.json"),
+        &files.user_configuration,
+    )?;
+    verified_json_write(&root.join("user_credentials.json"), &files.user_credentials)?;
+    verified_text_write(
+        &root.join("user_encrypt_installation.txt"),
+        &files.user_encrypt_installation,
+    )?;
+    write_or_remove_optional(
+        &root.join("user_full_name.txt"),
+        files.user_full_name.as_deref(),
+    )?;
+    write_or_remove_optional(
+        &root.join("user_email_address.txt"),
+        files.user_email.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn verified_json_write(path: &std::path::Path, expected: &str) -> Result<()> {
+    artifact::verified_replace(path, expected.as_bytes())?;
+    let observed = fs::read_to_string(path)?;
+    let expected_json: serde_json::Value = serde_json::from_str(expected)
+        .map_err(|error| Error::Message(format!("generated cidata JSON is invalid: {error}")))?;
+    let observed_json: serde_json::Value = serde_json::from_str(&observed)
+        .map_err(|error| Error::Message(format!("staged cidata JSON is invalid: {error}")))?;
+    if observed_json != expected_json {
+        return Err(Error::Message(format!(
+            "staged cidata JSON did not read back exactly from {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verified_text_write(path: &std::path::Path, expected: &str) -> Result<()> {
+    artifact::verified_replace(path, expected.as_bytes())?;
+    let observed = fs::read(path)?;
+    if observed != expected.as_bytes() {
+        return Err(Error::Message(format!(
+            "staged cidata text did not read back exactly from {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_or_remove_optional(path: &std::path::Path, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        verified_text_write(path, value)
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                if path.exists() {
+                    return Err(Error::Message(format!(
+                        "stale cidata file still exists at {}",
+                        path.display()
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 pub fn set_boot_next() -> Result<BootNextResult> {
@@ -668,7 +797,19 @@ try {{
     journal.pending_operation = Some(PendingOperation::SetBootNext);
     save_journal(&journal)?;
     run_storage_powershell(&format!(
-        r#"$ErrorActionPreference='Stop'; $bcdedit=Join-Path ([Environment]::SystemDirectory) 'bcdedit.exe'; $out=(& $bcdedit /set '{{fwbootmgr}}' bootsequence '{}' | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "bcdedit bootsequence failed: $out" }}; 'ok'"#,
+        r#"
+$ErrorActionPreference='Stop'
+$bcdedit=Join-Path ([Environment]::SystemDirectory) 'bcdedit.exe'
+$out=(& $bcdedit /set '{{fwbootmgr}}' bootsequence '{0}' | Out-String)
+if ($LASTEXITCODE -ne 0) {{ throw "bcdedit bootsequence failed: $out" }}
+$fw=(& $bcdedit /enum '{{fwbootmgr}}' /v | Out-String)
+if ($LASTEXITCODE -ne 0) {{ throw "could not read back firmware boot manager: $fw" }}
+$sequence=[regex]::Match($fw,'(?im)^bootsequence\s+(\{{[0-9a-fA-F-]+\}}(?:\r?\n\s+\{{[0-9a-fA-F-]+\}})*)')
+if (-not $sequence.Success -or $sequence.Value -notmatch [regex]::Escape('{0}')) {{
+  throw 'BootNext read-back did not contain the approved firmware entry'
+}}
+'ok'
+"#,
         boot_id.replace('\'', "''")
     ))?;
     journal.pending_operation = None;
@@ -742,6 +883,12 @@ if ($bootId) {{
   if ($sequence.Success -and $sequence.Value -match [regex]::Escape($bootId)) {{ $clear=(& $bcdedit /deletevalue '{{fwbootmgr}}' bootsequence | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not clear our boot sequence: $clear" }} }}
   $entry=(& $bcdedit /enum $bootId /v 2>&1 | Out-String)
   if ($LASTEXITCODE -eq 0) {{ $del=(& $bcdedit /delete $bootId /cleanup | Out-String); if ($LASTEXITCODE -ne 0) {{ throw "could not delete firmware entry: $del" }} }}
+  $fw=(& $bcdedit /enum '{{fwbootmgr}}' /v | Out-String)
+  if ($LASTEXITCODE -ne 0) {{ throw "could not verify firmware boot manager after rollback: $fw" }}
+  $sequence=[regex]::Match($fw,'(?im)^bootsequence\s+(\{{[0-9a-fA-F-]+\}}(?:\r?\n\s+\{{[0-9a-fA-F-]+\}})*)')
+  if ($sequence.Success -and $sequence.Value -match [regex]::Escape($bootId)) {{ throw 'rollback left the installer in BootNext' }}
+  $entry=(& $bcdedit /enum $bootId /v 2>&1 | Out-String)
+  if ($LASTEXITCODE -eq 0) {{ throw 'rollback left the installer firmware entry behind' }}
 }}
 if ('{esp_root}') {{
   $esp=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{esp_partition_guid}' }}
@@ -752,6 +899,9 @@ if ('{esp_root}') {{
   Remove-Item -Recurse -Force ($root + 'EFI\OmarchyInstall') -ErrorAction SilentlyContinue
   Remove-Item -Force ($root + 'boot\grub\grub.cfg') -ErrorAction SilentlyContinue
   {bait_remove}
+  if (Test-Path -LiteralPath ($root + 'EFI\OmarchyInstall')) {{ throw 'rollback left installer EFI files behind' }}
+  if (Test-Path -LiteralPath ($root + 'boot\grub\grub.cfg')) {{ throw 'rollback left installer GRUB configuration behind' }}
+  {bait_verify}
 }}
 function Remove-Staged([string]$guid,[uint64]$offset,[uint64]$size,[string]$label) {{
   $matches=@()
@@ -769,11 +919,22 @@ function Remove-Staged([string]$guid,[uint64]$offset,[uint64]$size,[string]$labe
 }}
 Remove-Staged '{ci_guid}' ([uint64]{ci_offset}) ([uint64]{ci_size}) 'cidata'
 Remove-Staged '{om_guid}' ([uint64]{om_offset}) ([uint64]{om_size}) 'OMARCHYINST'
+function Assert-StagedAbsent([string]$guid,[uint64]$offset,[string]$label) {{
+  $matches=@(Get-Partition -DiskNumber {disk_number} | Where-Object {{
+    ($guid -and ([string]$_.Guid).Trim('{{}}') -eq $guid.Trim('{{}}')) -or
+    ($offset -gt 0 -and [uint64]$_.Offset -eq $offset)
+  }})
+  if ($matches.Count -ne 0) {{ throw "rollback left the $label partition behind" }}
+}}
+Assert-StagedAbsent '{ci_guid}' ([uint64]{ci_offset}) 'cidata'
+Assert-StagedAbsent '{om_guid}' ([uint64]{om_offset}) 'OMARCHYINST'
 if ({old_c} -gt 0) {{
   $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}
   if (-not $c) {{ throw 'journaled Windows partition disappeared' }}
   if ([uint64]$c.Size -lt [uint64]{old_c}) {{ Resize-Partition -DiskNumber {disk_number} -PartitionNumber $c.PartitionNumber -Size ([uint64]{old_c}) -Confirm:$false -ErrorAction Stop }}
   elseif ([uint64]$c.Size -ne [uint64]{old_c}) {{ throw 'Windows partition is larger than its journaled original size' }}
+  $c=Get-Partition -DiskNumber {disk_number} | Where-Object {{ ([string]$_.Guid).Trim('{{}}') -eq '{windows_guid}' }}
+  if (-not $c -or [uint64]$c.Size -ne [uint64]{old_c}) {{ throw 'Windows partition rollback did not read back at its original size' }}
 }}
 Write-Output 'ok'
 "#,
@@ -786,6 +947,13 @@ Write-Output 'ok'
         boot_id = boot_id.replace('\'', "''"),
         boot_description = boot_description.replace('\'', "''"),
         bait_remove = bait_remove,
+        bait_verify = bait_win
+            .as_ref()
+            .map(|path| format!(
+                "if (Test-Path -LiteralPath ($root + '{}')) {{ throw 'rollback left the ISO search marker behind' }}",
+                path.replace('\'', "''")
+            ))
+            .unwrap_or_default(),
         om_offset = om_offset,
         om_size = om_size,
         ci_offset = ci_offset,
@@ -797,12 +965,27 @@ Write-Output 'ok'
     let result = interpret_rollback_output(true, &out, old_c, restored_power)?;
     if restore_hiber {
         run_powercfg("on")?;
+        if !get_hklm_dword(POWER_KEY, HIBERNATE_ENABLED).is_some_and(|value| value != 0) {
+            return Err(Error::Message(
+                "rollback could not verify that hibernation was restored".into(),
+            ));
+        }
     }
     if let Some(value) = journal.hiberboot_was {
         set_hklm_dword(POWER_SESSION_KEY, HIBERBOOT_ENABLED, value)?;
+        if get_hklm_dword(POWER_SESSION_KEY, HIBERBOOT_ENABLED) != Some(value) {
+            return Err(Error::Message(
+                "rollback could not verify the original Fast Startup setting".into(),
+            ));
+        }
     }
     let path = journal_path()?;
-    fs::remove_file(path).ok();
+    fs::remove_file(&path)?;
+    if path.exists() {
+        return Err(Error::Message(
+            "rollback completed but recovery state could not be removed".into(),
+        ));
+    }
     Ok(result)
 }
 

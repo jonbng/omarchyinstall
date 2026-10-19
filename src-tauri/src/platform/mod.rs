@@ -155,6 +155,7 @@ pub enum JournalStep {
     OmarchyPartitionCreated,
     CidataPartitionCreated,
     Staged,
+    CidataWritten,
     BootEntryCreated,
     BootNextSet,
 }
@@ -167,6 +168,7 @@ pub enum PendingOperation {
     CreateOmarchyPartition,
     CreateCidataPartition,
     StageEsp,
+    WriteCidata,
     CreateBootEntry,
     SetBootNext,
     Rollback,
@@ -196,6 +198,8 @@ pub struct StateJournal {
     pub linux_device: Option<String>,
     pub old_c_size_bytes: Option<u64>,
     pub iso_sha256: Option<String>,
+    #[serde(default)]
+    pub plan_digest: Option<String>,
     pub search_filename: Option<String>,
     pub boot_id: Option<String>,
     pub boot_description: Option<String>,
@@ -233,6 +237,16 @@ pub fn load_install_state() -> crate::error::Result<Option<StateJournal>> {
     imp::load_install_state()
 }
 
+pub fn assess_install_recovery() -> crate::error::Result<crate::recovery::RecoveryAssessment> {
+    let journal = load_install_state()?;
+    let probe = if crate::recovery::needs_probe(journal.as_ref()) {
+        Some(probe_machine()?)
+    } else {
+        None
+    };
+    crate::recovery::assess(journal.as_ref(), probe.as_ref())
+}
+
 pub fn pick_local_iso(owner: Option<isize>) -> crate::error::Result<Option<std::path::PathBuf>> {
     imp::pick_local_iso(owner)
 }
@@ -246,6 +260,16 @@ pub struct PrepareResult {
     pub old_c_size_bytes: u64,
     pub new_c_size_bytes: u64,
     pub partition_bytes: u64,
+}
+
+pub use crate::plan::InstallPlanPreview;
+
+pub fn preview_install_plan(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    iso_size_bytes: u64,
+) -> crate::error::Result<InstallPlanPreview> {
+    imp::preview_install_plan(allow_bitlocker, iso_sha256, iso_size_bytes)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,8 +304,12 @@ pub struct RollbackResult {
     pub restored_power_settings: bool,
 }
 
-pub fn prepare_installer_partition(allow_bitlocker: bool) -> crate::error::Result<PrepareResult> {
-    imp::prepare_installer_partition(allow_bitlocker)
+pub fn prepare_installer_partition(
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    approved_plan_digest: String,
+) -> crate::error::Result<PrepareResult> {
+    imp::prepare_installer_partition(allow_bitlocker, iso_sha256, approved_plan_digest)
 }
 
 pub fn stage_bootloader() -> crate::error::Result<StageResult> {

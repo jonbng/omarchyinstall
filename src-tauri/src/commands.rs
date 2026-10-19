@@ -3,9 +3,10 @@ use crate::download::{self, LocalIsoSelection, VerifyResult};
 use crate::error::Result;
 use crate::operation::OperationGate;
 use crate::platform::{
-    self, BootNextResult, CidataResult, HostInfo, MachineProbe, PrepareResult, RollbackResult,
-    StageResult, StateJournal,
+    self, HostInfo, InstallPlanPreview, MachineProbe, RollbackResult, StateJournal,
 };
+use crate::recovery::RecoveryAssessment;
+use crate::workflow::{InstallProgress, InstallRequest};
 use tauri::{Emitter, State};
 
 async fn run_blocking<T, F>(name: &'static str, work: F) -> Result<T>
@@ -74,6 +75,18 @@ pub async fn reboot_to_firmware(operation: State<'_, OperationGate>) -> Result<(
 #[tauri::command]
 pub fn load_install_state() -> Result<Option<StateJournal>> {
     platform::load_install_state()
+}
+
+#[tauri::command]
+pub async fn assess_install_recovery(
+    operation: State<'_, OperationGate>,
+) -> Result<RecoveryAssessment> {
+    let _operation = operation.lock().await;
+    run_blocking(
+        "install recovery assessment",
+        platform::assess_install_recovery,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -163,36 +176,47 @@ pub async fn verify_iso(
 }
 
 #[tauri::command]
-pub async fn prepare_installer_partition(
+pub async fn preview_install_plan(
     allow_bitlocker: bool,
+    iso_sha256: String,
+    iso_size_bytes: u64,
     operation: State<'_, OperationGate>,
-) -> Result<PrepareResult> {
+) -> Result<InstallPlanPreview> {
     let _operation = operation.lock().await;
-    run_blocking("installer partition preparation", move || {
-        platform::prepare_installer_partition(allow_bitlocker)
+    run_blocking("install plan preview", move || {
+        platform::preview_install_plan(allow_bitlocker, iso_sha256, iso_size_bytes)
     })
     .await
 }
 
 #[tauri::command]
-pub async fn stage_bootloader(operation: State<'_, OperationGate>) -> Result<StageResult> {
-    let _operation = operation.lock().await;
-    run_blocking("bootloader staging", platform::stage_bootloader).await
-}
-
-#[tauri::command]
-pub async fn write_cidata(
+pub async fn execute_install(
+    app: tauri::AppHandle,
     identity: CidataIdentity,
+    allow_bitlocker: bool,
+    iso_sha256: String,
+    approved_plan_digest: String,
     operation: State<'_, OperationGate>,
-) -> Result<CidataResult> {
-    let _operation = operation.lock().await;
-    run_blocking("cidata writing", move || platform::write_cidata(identity)).await
-}
-
-#[tauri::command]
-pub async fn set_boot_next(operation: State<'_, OperationGate>) -> Result<BootNextResult> {
-    let _operation = operation.lock().await;
-    run_blocking("BootNext configuration", platform::set_boot_next).await
+) -> Result<StateJournal> {
+    let control = operation.inner().clone();
+    let _operation = control.lock().await;
+    control.reset_cancellation();
+    let cancellation = control.clone();
+    run_blocking("install execution", move || {
+        crate::workflow::execute(
+            InstallRequest {
+                identity,
+                allow_bitlocker,
+                iso_sha256,
+                approved_plan_digest,
+            },
+            move |progress: InstallProgress| {
+                let _ = app.emit("install://progress", &progress);
+            },
+            move || cancellation.cancellation_requested(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -203,6 +227,7 @@ pub async fn reboot_to_installer(operation: State<'_, OperationGate>) -> Result<
 
 #[tauri::command]
 pub async fn abort_and_rollback(operation: State<'_, OperationGate>) -> Result<RollbackResult> {
+    operation.request_cancellation();
     let _operation = operation.lock().await;
     run_blocking("installer rollback", platform::abort_and_rollback).await
 }
