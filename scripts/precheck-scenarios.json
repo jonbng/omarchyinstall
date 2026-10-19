@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    { "name": "healthy", "faults": [], "expectedBlockers": [] },
+    { "name": "bitlocker-active-is-warning", "faults": ["active-bitlocker"], "expectedBlockers": [] },
+    { "name": "tpm-absent-is-supported", "faults": ["no-tpm"], "expectedBlockers": [] },
+    { "name": "shrink-capacity-deferred", "faults": ["deferred-shrink"], "expectedBlockers": [] },
+    { "name": "unsupported-secondary-disk-is-ignored", "faults": ["secondary-unsupported"], "expectedBlockers": [] },
+
+    { "name": "not-elevated", "faults": ["not-elevated"], "expectedBlockers": ["notElevated"] },
+    { "name": "legacy-bios", "faults": ["legacy-bios"], "expectedBlockers": ["notUefi"] },
+    { "name": "secure-boot", "faults": ["secure-boot"], "expectedBlockers": ["secureBoot"] },
+    { "name": "efi-variables-locked", "faults": ["efi-vars-locked"], "expectedBlockers": ["efiVarsLocked"] },
+    { "name": "low-installed-memory", "faults": ["low-installed-ram"], "expectedBlockers": ["ram"] },
+    { "name": "low-usable-memory", "faults": ["low-usable-ram"], "expectedBlockers": ["ram"] },
+    { "name": "mbr-boot-disk", "faults": ["mbr-boot-disk"], "expectedBlockers": ["notGpt"] },
+    { "name": "rst-boot-disk", "faults": ["rst-boot-disk"], "expectedBlockers": ["rst"] },
+    { "name": "dynamic-boot-disk", "faults": ["dynamic-boot-disk"], "expectedBlockers": ["dynamic"] },
+    { "name": "storage-spaces-boot-disk", "faults": ["storage-spaces-boot-disk"], "expectedBlockers": ["storageSpaces"] },
+    { "name": "insufficient-shrink", "faults": ["shrink-too-small"], "expectedBlockers": ["shrinkTooSmall"] },
+    { "name": "missing-esp", "faults": ["missing-esp"], "expectedBlockers": ["missingEsp"] },
+    { "name": "ambiguous-esp", "faults": ["ambiguous-esp"], "expectedBlockers": ["ambiguousEsp"] },
+    { "name": "storage-timeout", "faults": ["incomplete-storage"], "expectedBlockers": ["probeIncomplete"] },
+    { "name": "bitlocker-timeout", "faults": ["incomplete-bitlocker"], "expectedBlockers": ["probeIncomplete"] },
+    { "name": "missing-linux-identity", "faults": ["missing-linux-identity"], "expectedBlockers": ["probeIncomplete"] },
+
+    {
+      "name": "multiple-independent-failures",
+      "faults": ["not-elevated", "secure-boot", "low-installed-ram", "rst-boot-disk"],
+      "expectedBlockers": ["notElevated", "ram", "rst", "secureBoot"]
+    },
+    {
+      "name": "secondary-problems-never-mask-target-problem",
+      "faults": ["secondary-unsupported", "mbr-boot-disk"],
+      "expectedBlockers": ["notGpt"]
+    }
+  ]
+}

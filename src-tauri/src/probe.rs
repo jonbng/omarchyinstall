@@ -145,6 +145,23 @@ pub fn volume_is_fve(boot_sector: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::platform::{BitlockerVolume, DiskMap, HostInfo, MachineProbe, PartitionMap};
+    use serde::Deserialize;
+    use std::collections::HashSet;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScenarioFile {
+        schema_version: u32,
+        cases: Vec<ScenarioCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScenarioCase {
+        name: String,
+        faults: Vec<String>,
+        expected_blockers: Vec<String>,
+    }
 
     fn host(native: bool, elevated: bool) -> HostInfo {
         HostInfo {
@@ -205,6 +222,115 @@ mod tests {
                 }],
             }],
             blocking_reasons: vec![],
+        }
+    }
+
+    fn apply_scenario_fault(probe: &mut MachineProbe, fault: &str) {
+        match fault {
+            "not-elevated" => probe.host.elevated = false,
+            "legacy-bios" => {
+                probe.uefi = false;
+                probe.efi_vars_writable = false;
+            }
+            "secure-boot" => probe.secure_boot = true,
+            "efi-vars-locked" => probe.efi_vars_writable = false,
+            "low-installed-ram" => probe.ram_installed_bytes = RAM_INSTALLED_MIN - 1,
+            "low-usable-ram" => probe.ram_total_phys_bytes = RAM_TOTAL_PHYS_MIN - 1,
+            "mbr-boot-disk" => probe.disks[0].partition_style = "mbr".into(),
+            "rst-boot-disk" => probe.disks[0].is_rst = true,
+            "dynamic-boot-disk" => probe.disks[0].is_dynamic = true,
+            "storage-spaces-boot-disk" => probe.disks[0].is_storage_spaces = true,
+            "shrink-too-small" => probe.disks[0].max_shrink_bytes = Some(GIB),
+            "deferred-shrink" => probe.disks[0].max_shrink_bytes = None,
+            "missing-esp" => probe.target_esp = None,
+            "ambiguous-esp" => {
+                probe.target_esp = None;
+                probe.blocking_reasons.push(BlockingReason::AmbiguousEsp {
+                    disk_id: probe.disks[0].device_id.clone(),
+                    count: 2,
+                });
+            }
+            "incomplete-storage" => {
+                probe.target_esp = None;
+                probe
+                    .blocking_reasons
+                    .push(BlockingReason::ProbeIncomplete {
+                        component: "native Windows storage inventory".into(),
+                        detail: "injected timeout".into(),
+                    });
+            }
+            "incomplete-bitlocker" => {
+                probe
+                    .blocking_reasons
+                    .push(BlockingReason::ProbeIncomplete {
+                        component: "BitLocker WMI".into(),
+                        detail: "injected timeout".into(),
+                    });
+            }
+            "missing-linux-identity" => {
+                probe.linux_by_id = None;
+                probe
+                    .blocking_reasons
+                    .push(BlockingReason::ProbeIncomplete {
+                        component: "target Linux disk identity".into(),
+                        detail: "injected missing serial".into(),
+                    });
+            }
+            "active-bitlocker" => {
+                probe.bitlocker[0].protection_status = 1;
+                probe.bitlocker[0].conversion_status = 1;
+                probe.bitlocker[0].fully_decrypted = false;
+            }
+            "no-tpm" => probe.tpm_present = false,
+            "secondary-unsupported" => {
+                let mut secondary = probe.disks[0].clone();
+                secondary.device_id = r"\\.\PHYSICALDRIVE1".into();
+                secondary.is_boot = false;
+                secondary.is_rst = true;
+                secondary.is_dynamic = true;
+                secondary.is_storage_spaces = true;
+                probe.disks.push(secondary);
+            }
+            unknown => panic!("unknown precheck scenario fault {unknown:?}"),
+        }
+    }
+
+    fn blocker_types(probe: &MachineProbe) -> Vec<String> {
+        let mut types: Vec<String> = probe
+            .blocking_reasons
+            .iter()
+            .map(|reason| {
+                serde_json::to_value(reason).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        types.sort();
+        types
+    }
+
+    #[test]
+    fn data_driven_precheck_scenario_matrix() {
+        let scenarios: ScenarioFile =
+            serde_json::from_str(include_str!("../../scripts/precheck-scenarios.json")).unwrap();
+        assert_eq!(scenarios.schema_version, 1);
+        assert!(scenarios.cases.len() >= 20);
+
+        let mut names = HashSet::new();
+        for scenario in scenarios.cases {
+            assert!(
+                names.insert(scenario.name.clone()),
+                "duplicate scenario name"
+            );
+            let mut candidate = probe();
+            for fault in &scenario.faults {
+                apply_scenario_fault(&mut candidate, fault);
+            }
+            let actual = blocker_types(&attach_reasons(candidate, true));
+            let mut expected = scenario.expected_blockers;
+            expected.sort();
+            assert_eq!(actual, expected, "scenario {:?}", scenario.name);
         }
     }
 

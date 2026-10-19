@@ -210,16 +210,26 @@ $stageSummary = @($successful.timings | Group-Object stage | Sort-Object Name | 
     }
 })
 
+$observedBlockerTypes = New-Object Collections.Generic.List[string]
+if ($successful.Count -gt 0) {
+    foreach ($blockerType in @($successful[0].blockerTypes)) {
+        $observedBlockerTypes.Add([string]$blockerType)
+    }
+}
 $observed = [ordered]@{
     identityHash = @($identityHashes)[0]
     blockerHash = @($blockerHashes)[0]
-    blockerTypes = if ($successful.Count -gt 0) { @($successful[0].blockerTypes) } else { @() }
+    blockerTypes = @($observedBlockerTypes)
 }
 $baselineErrors = New-Object Collections.Generic.List[string]
 if (-not [string]::IsNullOrWhiteSpace($Baseline)) {
     $baselinePath = [IO.Path]::GetFullPath($Baseline)
     if ($UpdateBaseline) {
-        $observed | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $baselinePath -Encoding UTF8
+        if ($failed.Count -gt 0 -or $identityHashes.Count -ne 1 -or $blockerHashes.Count -ne 1 -or (-not $AllowIncomplete -and $incomplete.Count -gt 0)) {
+            $baselineErrors.Add("refusing to update a baseline from unstable, failed, or incomplete runs")
+        } else {
+            $observed | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $baselinePath -Encoding UTF8
+        }
     } elseif (Test-Path -LiteralPath $baselinePath) {
         $expected = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
         if ($expected.identityHash -ne $observed.identityHash) { $baselineErrors.Add("machine identity changed") }
