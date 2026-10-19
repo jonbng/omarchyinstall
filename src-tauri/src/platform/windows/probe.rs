@@ -45,7 +45,49 @@ const EFI_VARIABLE_ATTRIBUTES: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 const LDM_META: &str = "5808c8aa-7e8f-42e0-85d2-e1e90434cfb3";
 const LDM_DATA: &str = "af9b60a0-1431-4f62-bc68-3311714a69ad";
 const PRECHECK_SELF_TEST_ARG: &str = "--precheck-self-test";
+const PRECHECK_INJECT_ARG: &str = "--inject-provider-fault";
 const PRECHECK_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFault {
+    StorageTimeout,
+    StorageMalformed,
+    StorageHelperFailure,
+    StorageReportFailure,
+    BitlockerTimeout,
+    BitlockerMalformed,
+    BitlockerEmpty,
+    BitlockerWorkerPanic,
+}
+
+impl ProviderFault {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "storage-timeout" => Some(Self::StorageTimeout),
+            "storage-malformed" => Some(Self::StorageMalformed),
+            "storage-helper-failure" => Some(Self::StorageHelperFailure),
+            "storage-report-failure" => Some(Self::StorageReportFailure),
+            "bitlocker-timeout" => Some(Self::BitlockerTimeout),
+            "bitlocker-malformed" => Some(Self::BitlockerMalformed),
+            "bitlocker-empty" => Some(Self::BitlockerEmpty),
+            "bitlocker-worker-panic" => Some(Self::BitlockerWorkerPanic),
+            _ => None,
+        }
+    }
+
+    fn storage_error(self) -> Option<&'static str> {
+        match self {
+            Self::StorageTimeout => {
+                Some("native storage inventory timed out after 10 seconds (injected)")
+            }
+            Self::StorageMalformed => {
+                Some("storage inventory helper returned invalid JSON (injected)")
+            }
+            Self::StorageHelperFailure => Some("native storage inventory helper failed (injected)"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,11 +127,23 @@ struct PrecheckSelfTestEnvelope {
 
 pub(super) fn run_self_test_if_requested() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 1 || args[0] != PRECHECK_SELF_TEST_ARG {
+    if args.first().map(String::as_str) != Some(PRECHECK_SELF_TEST_ARG) {
         return false;
     }
     let started = Instant::now();
-    let envelope = match probe_machine_detailed() {
+    let fault = match args.as_slice() {
+        [_] => Ok(None),
+        [_, inject, value] if inject == PRECHECK_INJECT_ARG => ProviderFault::parse(value)
+            .map(Some)
+            .ok_or_else(|| format!("unknown provider fault {value:?}")),
+        _ => Err(format!(
+            "usage: {PRECHECK_SELF_TEST_ARG} [{PRECHECK_INJECT_ARG} <fault>]"
+        )),
+    };
+    let result = fault
+        .map_err(Error::Message)
+        .and_then(probe_machine_detailed_with_fault);
+    let envelope = match result {
         Ok((probe, diagnostics)) => PrecheckSelfTestEnvelope {
             protocol_version: PRECHECK_PROTOCOL_VERSION,
             elapsed_ms: started.elapsed().as_millis(),
@@ -125,6 +179,54 @@ pub fn probe_machine() -> Result<MachineProbe> {
 }
 
 pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagnostics)> {
+    probe_machine_detailed_with_fault(None)
+}
+
+fn query_native_storage(
+    injected_fault: Option<ProviderFault>,
+) -> (
+    Option<InventoryEnvelope>,
+    Option<NativeStorageReport>,
+    Option<String>,
+) {
+    if injected_fault == Some(ProviderFault::StorageReportFailure) {
+        let error = "native storage inventory failed in helper (injected)".to_string();
+        return (
+            Some(InventoryEnvelope {
+                protocol_version: native_storage::PROTOCOL_VERSION,
+                elapsed_ms: 0,
+                report: None,
+                error: Some(error.clone()),
+            }),
+            None,
+            Some(error),
+        );
+    }
+    if let Some(error) = injected_fault.and_then(ProviderFault::storage_error) {
+        return (None, None, Some(error.into()));
+    }
+    match native_storage::inventory_report() {
+        Ok(envelope) => {
+            let failure = envelope.error.clone();
+            let inventory = envelope.report.clone();
+            if let Some(inventory) = &inventory {
+                log::info!(
+                    "native storage inventory completed in {} ms",
+                    inventory.elapsed_ms
+                );
+            }
+            (Some(envelope), inventory, failure)
+        }
+        Err(error) => {
+            log::warn!("native storage inventory failed: {error}");
+            (None, None, Some(error.to_string()))
+        }
+    }
+}
+
+fn probe_machine_detailed_with_fault(
+    injected_fault: Option<ProviderFault>,
+) -> Result<(MachineProbe, NativeProbeDiagnostics)> {
     let probe_started = Instant::now();
     let mut timings = Vec::new();
     let stage = Instant::now();
@@ -136,7 +238,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     });
     // WMI is independent and occasionally slow. Let it overlap native storage
     // inventory so the two read-only checks do not serialize the precheck.
-    let bitlocker_thread = std::thread::spawn(query_bitlocker);
+    let bitlocker_thread = std::thread::spawn(move || query_bitlocker(injected_fault));
     let stage = Instant::now();
     let uefi = is_uefi();
     let secure_boot = secure_boot_enabled();
@@ -158,24 +260,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         succeeded: true,
     });
     let stage = Instant::now();
-    let (inventory_envelope, inventory, inventory_failure) =
-        match native_storage::inventory_report() {
-            Ok(envelope) => {
-                let failure = envelope.error.clone();
-                let inventory = envelope.report.clone();
-                if let Some(inventory) = &inventory {
-                    log::info!(
-                        "native storage inventory completed in {} ms",
-                        inventory.elapsed_ms
-                    );
-                }
-                (Some(envelope), inventory, failure)
-            }
-            Err(error) => {
-                log::warn!("native storage inventory failed: {error}");
-                (None, None, Some(error.to_string()))
-            }
-        };
+    let (inventory_envelope, inventory, inventory_failure) = query_native_storage(injected_fault);
     timings.push(ProbeStageTiming {
         stage: "storage".into(),
         elapsed_ms: stage.elapsed().as_millis(),
@@ -209,10 +294,14 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
         .as_ref()
         .map(disks_from_inventory)
         .unwrap_or_default();
-    let (mut bitlocker, bitlocker_association_failed) = inventory
-        .as_ref()
-        .map(|inventory| bitlocker_for_boot_disk(inventory, bitlocker_inventory))
-        .unwrap_or_default();
+    let (mut bitlocker, bitlocker_association_failed) = if bitlocker_error.is_none() {
+        inventory
+            .as_ref()
+            .map(|inventory| bitlocker_for_boot_disk(inventory, bitlocker_inventory))
+            .unwrap_or_default()
+    } else {
+        (Vec::new(), false)
+    };
 
     overlay_fve_signatures(&mut bitlocker, &disks);
 
@@ -244,7 +333,7 @@ pub(crate) fn probe_machine_detailed() -> Result<(MachineProbe, NativeProbeDiagn
     if bitlocker_association_failed {
         inventory_reasons.push(BlockingReason::ProbeIncomplete {
             component: "BitLocker volume-to-disk association".into(),
-            detail: "A BitLocker volume could not be matched to exactly one native volume extent."
+            detail: "BitLocker did not return exactly one complete record for Windows C: associated with one extent on the boot disk."
                 .into(),
         });
     }
@@ -547,8 +636,33 @@ fn overlay_fve_signatures(bitlocker: &mut Vec<BitlockerVolume>, disks: &[DiskMap
     }
 }
 
-fn query_bitlocker() -> BitlockerDiagnostics {
+fn query_bitlocker(injected_fault: Option<ProviderFault>) -> BitlockerDiagnostics {
     let started = Instant::now();
+    if injected_fault == Some(ProviderFault::BitlockerEmpty) {
+        return BitlockerDiagnostics {
+            elapsed_ms: started.elapsed().as_millis(),
+            volumes: Vec::new(),
+            error: None,
+        };
+    }
+    if let Some(error) = match injected_fault {
+        Some(ProviderFault::BitlockerTimeout) => {
+            Some("BitLocker WMI timed out after 15 seconds (injected)")
+        }
+        Some(ProviderFault::BitlockerMalformed) => {
+            Some("BitLocker WMI returned invalid JSON (injected)")
+        }
+        Some(ProviderFault::BitlockerWorkerPanic) => {
+            panic!("injected BitLocker WMI worker panic")
+        }
+        _ => None,
+    } {
+        return BitlockerDiagnostics {
+            elapsed_ms: started.elapsed().as_millis(),
+            volumes: Vec::new(),
+            error: Some(error.into()),
+        };
+    }
     match run_inventory_stage("BitLocker WMI", BITLOCKER_INVENTORY_PS, 15) {
         Ok(inventory) => BitlockerDiagnostics {
             elapsed_ms: started.elapsed().as_millis(),
@@ -627,7 +741,17 @@ fn bitlocker_for_boot_disk(
     inventory: &NativeStorageReport,
     bitlocker: Vec<PsBitlocker>,
 ) -> (Vec<BitlockerVolume>, bool) {
-    let mut association_failed = false;
+    let target_volumes = inventory.volumes.iter().filter(|volume| {
+        volume
+            .mount_paths
+            .iter()
+            .any(|path| drive_letter(path).as_deref() == Some("C:"))
+            && volume.extents.len() == 1
+            && volume.extents[0].disk_number == inventory.boot_disk_number
+    });
+    let target_volume_count = target_volumes.count();
+    let mut target_matches = 0usize;
+    let mut association_failed = target_volume_count != 1;
     let mut output = Vec::new();
     for item in bitlocker {
         let matched = inventory.volumes.iter().find(|volume| {
@@ -662,8 +786,16 @@ fn bitlocker_for_boot_disk(
         if volume.extents[0].disk_number != inventory.boot_disk_number {
             continue;
         }
+        let is_target = volume
+            .mount_paths
+            .iter()
+            .any(|path| drive_letter(path).as_deref() == Some("C:"));
+        if is_target {
+            target_matches += 1;
+            association_failed |= item.protection.is_none() || item.conversion.is_none();
+        }
         let conversion_status = item.conversion.unwrap_or(u32::MAX);
-        let protection_status = item.protection.unwrap_or(0);
+        let protection_status = item.protection.unwrap_or(u32::MAX);
         output.push(BitlockerVolume {
             device_id: item.device_id,
             disk_id: Some(format!(r"\\.\PHYSICALDRIVE{}", inventory.boot_disk_number)),
@@ -673,6 +805,7 @@ fn bitlocker_for_boot_disk(
             fully_decrypted: protection_status == 0 && conversion_status == 0,
         });
     }
+    association_failed |= target_matches != 1;
     (output, association_failed)
 }
 
@@ -831,6 +964,90 @@ fn sanitize_id(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::platform::windows::process::{system_command, SystemTool};
+
+    #[test]
+    fn provider_fault_vocabulary_is_stable() {
+        for name in [
+            "storage-timeout",
+            "storage-malformed",
+            "storage-helper-failure",
+            "storage-report-failure",
+            "bitlocker-timeout",
+            "bitlocker-malformed",
+            "bitlocker-empty",
+            "bitlocker-worker-panic",
+        ] {
+            assert!(ProviderFault::parse(name).is_some(), "{name}");
+        }
+        assert!(ProviderFault::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn injected_bitlocker_failures_return_immediately() {
+        for fault in [
+            ProviderFault::BitlockerTimeout,
+            ProviderFault::BitlockerMalformed,
+        ] {
+            let result = query_bitlocker(Some(fault));
+            assert!(result.elapsed_ms < 1_000, "{result:?}");
+            assert!(result.volumes.is_empty());
+            assert!(result.error.is_some());
+        }
+    }
+
+    fn bitlocker_test_inventory() -> NativeStorageReport {
+        NativeStorageReport {
+            elapsed_ms: 0,
+            boot_volume_guid: r"\\?\Volume{cccccccc-cccc-cccc-cccc-cccccccccccc}\".into(),
+            boot_disk_number: 0,
+            disks: Vec::new(),
+            volumes: vec![native_storage::NativeVolume {
+                volume_guid: r"\\?\Volume{cccccccc-cccc-cccc-cccc-cccccccccccc}\".into(),
+                mount_paths: vec![r"C:\".into()],
+                label: None,
+                fs: Some("NTFS".into()),
+                extents: vec![native_storage::NativeExtent {
+                    disk_number: 0,
+                    offset_bytes: 1_048_576,
+                    length_bytes: 100_000,
+                }],
+            }],
+            warnings: Vec::new(),
+            issues: Vec::new(),
+            timings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bitlocker_inventory_must_report_the_windows_volume_exactly_once() {
+        let inventory = bitlocker_test_inventory();
+        assert!(bitlocker_for_boot_disk(&inventory, Vec::new()).1);
+
+        let complete = PsBitlocker {
+            device_id: Some(inventory.boot_volume_guid.clone()),
+            mount: Some("C:".into()),
+            protection: Some(0),
+            conversion: Some(0),
+        };
+        let (volumes, failed) = bitlocker_for_boot_disk(&inventory, vec![complete.clone()]);
+        assert!(!failed);
+        assert_eq!(volumes.len(), 1);
+        assert!(volumes[0].fully_decrypted);
+
+        assert!(bitlocker_for_boot_disk(&inventory, vec![complete.clone(), complete]).1);
+    }
+
+    #[test]
+    fn incomplete_bitlocker_status_fails_closed() {
+        let inventory = bitlocker_test_inventory();
+        let incomplete = PsBitlocker {
+            device_id: Some(inventory.boot_volume_guid.clone()),
+            mount: Some("C:".into()),
+            protection: None,
+            conversion: Some(0),
+        };
+        assert!(bitlocker_for_boot_disk(&inventory, vec![incomplete]).1);
+    }
 
     #[test]
     fn staged_inventory_powershell_is_syntactically_valid() {

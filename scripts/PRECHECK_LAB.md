@@ -53,5 +53,42 @@ The storage-specific cross-validation harness remains useful when changing disk
 enumeration: `windows-storage-soak.ps1` independently compares native fields to
 `Get-Disk`, `Get-Partition`, `Get-Volume`, and WMI.
 
+## Provider failure matrix
+
+The provider fault lab verifies that timeouts, malformed or unexpectedly empty
+responses, helper failures, and a panicking BitLocker worker all fail closed,
+return promptly, and leave no child process behind:
+
+```powershell
+.\scripts\windows-precheck-fault-lab.ps1 `
+  -Exe .\src-tauri\target\release\OmarchyInstaller.exe `
+  -Iterations 10 `
+  -Concurrency 4
+```
+
+These faults are accepted only by the private `--precheck-self-test` command.
+They do not alter normal GUI probing and never mutate storage. The lab writes a
+full `runs.json` plus a compact `summary.json` to `precheck-fault-lab`.
+
+The deterministic policy matrix requires no VM or Windows host:
+
+```powershell
+bun run check:prechecks
+```
+
+Its cases live in `precheck-scenarios.json`. Every named fault must produce the
+exact expected blocker set. Additional generated tests exercise all combinations
+of independent target failures and up to sixteen unsupported secondary disks.
+
+The same faults can drive the local development UI without Windows:
+
+```powershell
+$env:OMARCHY_STUB_BLOCKS = "ambiguous-esp,incomplete-bitlocker"
+bun run tauri:dev
+```
+
+This uses the exact fault vocabulary from `precheck-scenarios.json`, so policy
+tests and visual error-state testing cannot silently drift apart.
+
 All lab operations are read-only. Shrink-capacity analysis remains deferred, and
 the harness never resizes, formats, mounts, or changes a partition.

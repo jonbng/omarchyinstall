@@ -125,6 +125,80 @@ pub fn attach_reasons(mut probe: MachineProbe, check_elevation: bool) -> Machine
     probe
 }
 
+/// Applies deterministic failures for policy tests and the non-Windows
+/// development UI. Production Windows probing never calls this function.
+#[cfg(any(test, not(windows)))]
+pub(crate) fn apply_named_fault(probe: &mut MachineProbe, fault: &str) -> bool {
+    match fault {
+        "not-elevated" => probe.host.elevated = false,
+        "legacy-bios" => {
+            probe.uefi = false;
+            probe.efi_vars_writable = false;
+        }
+        "secure-boot" => probe.secure_boot = true,
+        "efi-vars-locked" => probe.efi_vars_writable = false,
+        "low-installed-ram" => probe.ram_installed_bytes = RAM_INSTALLED_MIN - 1,
+        "low-usable-ram" => probe.ram_total_phys_bytes = RAM_TOTAL_PHYS_MIN - 1,
+        "mbr-boot-disk" => probe.disks[0].partition_style = "mbr".into(),
+        "rst-boot-disk" => probe.disks[0].is_rst = true,
+        "dynamic-boot-disk" => probe.disks[0].is_dynamic = true,
+        "storage-spaces-boot-disk" => probe.disks[0].is_storage_spaces = true,
+        "shrink-too-small" => probe.disks[0].max_shrink_bytes = Some(GIB),
+        "deferred-shrink" => probe.disks[0].max_shrink_bytes = None,
+        "missing-esp" => probe.target_esp = None,
+        "ambiguous-esp" => {
+            probe.target_esp = None;
+            probe.blocking_reasons.push(BlockingReason::AmbiguousEsp {
+                disk_id: probe.disks[0].device_id.clone(),
+                count: 2,
+            });
+        }
+        "incomplete-storage" => {
+            probe.target_esp = None;
+            probe
+                .blocking_reasons
+                .push(BlockingReason::ProbeIncomplete {
+                    component: "native Windows storage inventory".into(),
+                    detail: "injected timeout".into(),
+                });
+        }
+        "incomplete-bitlocker" => {
+            probe
+                .blocking_reasons
+                .push(BlockingReason::ProbeIncomplete {
+                    component: "BitLocker WMI".into(),
+                    detail: "injected timeout".into(),
+                });
+        }
+        "missing-linux-identity" => {
+            probe.linux_by_id = None;
+            probe
+                .blocking_reasons
+                .push(BlockingReason::ProbeIncomplete {
+                    component: "target Linux disk identity".into(),
+                    detail: "injected missing serial".into(),
+                });
+        }
+        "active-bitlocker" => {
+            probe.bitlocker[0].protection_status = 1;
+            probe.bitlocker[0].conversion_status = 1;
+            probe.bitlocker[0].fully_decrypted = false;
+        }
+        "no-tpm" => probe.tpm_present = false,
+        "secondary-unsupported" => {
+            let mut secondary = probe.disks[0].clone();
+            secondary.device_id = format!(r"\\.\PHYSICALDRIVE{}", probe.disks.len());
+            secondary.is_boot = false;
+            secondary.is_rst = true;
+            secondary.is_dynamic = true;
+            secondary.is_storage_spaces = true;
+            probe.disks.push(secondary);
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// True when a BitLocker WMI/PS volume is fully decrypted *and* the on-disk
 /// partition boot sector is not still `-FVE-FS-` (suspend leaves the signature).
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -225,76 +299,6 @@ mod tests {
         }
     }
 
-    fn apply_scenario_fault(probe: &mut MachineProbe, fault: &str) {
-        match fault {
-            "not-elevated" => probe.host.elevated = false,
-            "legacy-bios" => {
-                probe.uefi = false;
-                probe.efi_vars_writable = false;
-            }
-            "secure-boot" => probe.secure_boot = true,
-            "efi-vars-locked" => probe.efi_vars_writable = false,
-            "low-installed-ram" => probe.ram_installed_bytes = RAM_INSTALLED_MIN - 1,
-            "low-usable-ram" => probe.ram_total_phys_bytes = RAM_TOTAL_PHYS_MIN - 1,
-            "mbr-boot-disk" => probe.disks[0].partition_style = "mbr".into(),
-            "rst-boot-disk" => probe.disks[0].is_rst = true,
-            "dynamic-boot-disk" => probe.disks[0].is_dynamic = true,
-            "storage-spaces-boot-disk" => probe.disks[0].is_storage_spaces = true,
-            "shrink-too-small" => probe.disks[0].max_shrink_bytes = Some(GIB),
-            "deferred-shrink" => probe.disks[0].max_shrink_bytes = None,
-            "missing-esp" => probe.target_esp = None,
-            "ambiguous-esp" => {
-                probe.target_esp = None;
-                probe.blocking_reasons.push(BlockingReason::AmbiguousEsp {
-                    disk_id: probe.disks[0].device_id.clone(),
-                    count: 2,
-                });
-            }
-            "incomplete-storage" => {
-                probe.target_esp = None;
-                probe
-                    .blocking_reasons
-                    .push(BlockingReason::ProbeIncomplete {
-                        component: "native Windows storage inventory".into(),
-                        detail: "injected timeout".into(),
-                    });
-            }
-            "incomplete-bitlocker" => {
-                probe
-                    .blocking_reasons
-                    .push(BlockingReason::ProbeIncomplete {
-                        component: "BitLocker WMI".into(),
-                        detail: "injected timeout".into(),
-                    });
-            }
-            "missing-linux-identity" => {
-                probe.linux_by_id = None;
-                probe
-                    .blocking_reasons
-                    .push(BlockingReason::ProbeIncomplete {
-                        component: "target Linux disk identity".into(),
-                        detail: "injected missing serial".into(),
-                    });
-            }
-            "active-bitlocker" => {
-                probe.bitlocker[0].protection_status = 1;
-                probe.bitlocker[0].conversion_status = 1;
-                probe.bitlocker[0].fully_decrypted = false;
-            }
-            "no-tpm" => probe.tpm_present = false,
-            "secondary-unsupported" => {
-                let mut secondary = probe.disks[0].clone();
-                secondary.device_id = r"\\.\PHYSICALDRIVE1".into();
-                secondary.is_boot = false;
-                secondary.is_rst = true;
-                secondary.is_dynamic = true;
-                secondary.is_storage_spaces = true;
-                probe.disks.push(secondary);
-            }
-            unknown => panic!("unknown precheck scenario fault {unknown:?}"),
-        }
-    }
-
     fn blocker_types(probe: &MachineProbe) -> Vec<String> {
         let mut types: Vec<String> = probe
             .blocking_reasons
@@ -318,6 +322,7 @@ mod tests {
         assert!(scenarios.cases.len() >= 20);
 
         let mut names = HashSet::new();
+        let mut exercised_faults = HashSet::new();
         for scenario in scenarios.cases {
             assert!(
                 names.insert(scenario.name.clone()),
@@ -325,12 +330,101 @@ mod tests {
             );
             let mut candidate = probe();
             for fault in &scenario.faults {
-                apply_scenario_fault(&mut candidate, fault);
+                exercised_faults.insert(fault.clone());
+                assert!(
+                    apply_named_fault(&mut candidate, fault),
+                    "unknown precheck scenario fault {fault:?}"
+                );
             }
             let actual = blocker_types(&attach_reasons(candidate, true));
             let mut expected = scenario.expected_blockers;
             expected.sort();
+            println!("precheck scenario {} => {actual:?}", scenario.name);
             assert_eq!(actual, expected, "scenario {:?}", scenario.name);
+        }
+        let expected_faults: HashSet<String> = [
+            "active-bitlocker",
+            "ambiguous-esp",
+            "deferred-shrink",
+            "dynamic-boot-disk",
+            "efi-vars-locked",
+            "incomplete-bitlocker",
+            "incomplete-storage",
+            "legacy-bios",
+            "low-installed-ram",
+            "low-usable-ram",
+            "mbr-boot-disk",
+            "missing-esp",
+            "missing-linux-identity",
+            "no-tpm",
+            "not-elevated",
+            "rst-boot-disk",
+            "secondary-unsupported",
+            "secure-boot",
+            "shrink-too-small",
+            "storage-spaces-boot-disk",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            exercised_faults, expected_faults,
+            "every implemented scenario fault must remain exercised"
+        );
+    }
+
+    #[test]
+    fn independent_precheck_failures_compose_for_every_combination() {
+        let independent = [
+            ("not-elevated", "notElevated"),
+            ("secure-boot", "secureBoot"),
+            ("low-installed-ram", "ram"),
+            ("mbr-boot-disk", "notGpt"),
+            ("rst-boot-disk", "rst"),
+            ("dynamic-boot-disk", "dynamic"),
+            ("storage-spaces-boot-disk", "storageSpaces"),
+        ];
+        for mask in 0..(1usize << independent.len()) {
+            let mut candidate = probe();
+            let mut expected = Vec::new();
+            for (index, (fault, blocker)) in independent.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    assert!(apply_named_fault(&mut candidate, fault));
+                    expected.push((*blocker).to_string());
+                }
+            }
+            expected.sort();
+            assert_eq!(
+                blocker_types(&attach_reasons(candidate, true)),
+                expected,
+                "independent fault mask {mask:#09b}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_number_of_unsupported_secondary_disks_remains_nonblocking() {
+        for count in 1..=16 {
+            let mut candidate = probe();
+            for number in 1..=count {
+                let mut secondary = candidate.disks[0].clone();
+                secondary.device_id = format!(r"\\.\PHYSICALDRIVE{number}");
+                secondary.is_boot = false;
+                secondary.is_rst = number & 1 != 0;
+                secondary.is_dynamic = number & 2 != 0;
+                secondary.is_storage_spaces = number & 4 != 0;
+                secondary.partition_style = if number & 8 != 0 {
+                    "mbr".into()
+                } else {
+                    "gpt".into()
+                };
+                candidate.disks.push(secondary);
+            }
+            assert_eq!(
+                blocker_types(&attach_reasons(candidate, true)),
+                Vec::<String>::new(),
+                "{count} secondary disks"
+            );
         }
     }
 

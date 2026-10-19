@@ -11,7 +11,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --no-bundle",
     "check:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "check:rust:release": "cargo test --release --manifest-path src-tauri/Cargo.toml"
+    "check:rust:release": "cargo test --release --manifest-path src-tauri/Cargo.toml",
+    "check:prechecks": "cargo test --release --manifest-path src-tauri/Cargo.toml probe::tests:: -- --nocapture"
   },
   "dependencies": {
     "react": "^19.1.0",

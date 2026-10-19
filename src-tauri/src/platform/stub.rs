@@ -504,49 +504,20 @@ pub fn parse_stub_blocks(s: &str) -> Vec<String> {
 
 pub fn apply_stub_blocks(probe: &mut MachineProbe, blocks: &[String]) {
     for block in blocks {
-        match block.as_str() {
-            "secure-boot" | "secureboot" => probe.secure_boot = true,
-            "rst" => {
-                if let Some(d) = probe.disks.first_mut() {
-                    d.is_rst = true;
-                }
-            }
-            "ram" => {
-                probe.ram_installed_bytes = 8 * GIB;
-                probe.ram_total_phys_bytes = 7 * GIB;
-            }
-            "not-uefi" | "bios" => probe.uefi = false,
-            "bitlocker" => {
-                if let Some(v) = probe.bitlocker.first_mut() {
-                    v.fully_decrypted = false;
-                    v.protection_status = 1;
-                    v.conversion_status = 1;
-                }
-            }
-            "efi-vars" | "efivarslocked" => probe.efi_vars_writable = false,
-            "not-elevated" => probe.host.elevated = false,
-            "dynamic" => {
-                if let Some(d) = probe.disks.first_mut() {
-                    d.is_dynamic = true;
-                }
-            }
-            "storage-spaces" | "spaces" => {
-                if let Some(d) = probe.disks.first_mut() {
-                    d.is_storage_spaces = true;
-                }
-            }
-            "shrink" => {
-                if let Some(d) = probe.disks.first_mut() {
-                    d.max_shrink_bytes = Some(GIB);
-                }
-            }
-            "not-gpt" | "mbr" => {
-                if let Some(d) = probe.disks.first_mut() {
-                    d.partition_style = "mbr".into();
-                }
-            }
-            _ => {}
-        }
+        let canonical = match block.as_str() {
+            "secureboot" => "secure-boot",
+            "rst" => "rst-boot-disk",
+            "ram" => "low-installed-ram",
+            "not-uefi" | "bios" => "legacy-bios",
+            "bitlocker" => "active-bitlocker",
+            "efi-vars" | "efivarslocked" => "efi-vars-locked",
+            "dynamic" => "dynamic-boot-disk",
+            "storage-spaces" | "spaces" => "storage-spaces-boot-disk",
+            "shrink" => "shrink-too-small",
+            "not-gpt" | "mbr" => "mbr-boot-disk",
+            other => other,
+        };
+        let _ = probe::apply_named_fault(probe, canonical);
     }
 }
 

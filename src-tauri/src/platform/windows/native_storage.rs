@@ -41,7 +41,7 @@ use windows::{
 const MAX_IOCTL_BYTES: usize = 1024 * 1024;
 const HELPER_ARG: &str = "--storage-helper";
 const SELF_TEST_ARG: &str = "--storage-self-test";
-const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(10);
 const ESP_TYPE_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 
